@@ -1,5 +1,23 @@
 ## BEGIN: My ignores
 
+# Python logs
+py/logs/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python package metadata
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Environment variables (may contain secrets)
+.env
+
 # Build results
 [Vv]ista[Dd]ebug
 [Vv]ista[Rr]elease

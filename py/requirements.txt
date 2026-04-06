@@ -1,0 +1,13 @@
+# NetLimiter 监控系统 Python 版本依赖
+
+# 用于调用 .NET API (NetLimiter)
+pythonnet>=3.0.0
+
+# 用于 SSH 连接 (路由器速度采样)
+paramiko>=3.0.0
+
+# 用于加密支持 (paramiko 依赖)
+cryptography>=41.0.0
+
+# 用于文件锁（进程间互斥）
+filelock>=3.0.0
