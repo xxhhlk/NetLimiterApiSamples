@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import time
+import socket
 import signal
 import argparse
 from pathlib import Path
@@ -300,7 +301,7 @@ class RouterSpeedSampler:
             
             self.ssh_channel = transport.open_session()
             self.ssh_channel.exec_command(self.ROUTER_SCRIPT)
-            self.ssh_channel.settimeout(5.0)  # 设置读取超时
+            self.ssh_channel.settimeout(1.0)  # 读取超时 1 秒，保证及时响应
             
             self.logger.info("SSH 连接成功", event="SSH_CONNECTED")
             self.ssh_consecutive_failures = 0
@@ -313,36 +314,60 @@ class RouterSpeedSampler:
             return False
     
     def _read_router_speed(self) -> Optional[float]:
-        """读取路由器速度（非阻塞）"""
+        """
+        读取路由器速度（阻塞带超时）
+
+        使用 channel 的超时设置（1秒），有数据立即返回，无数据阻塞等待。
+
+        Returns:
+            速度值（KB/s），无数据或超时返回 None
+        """
         if not self.ssh_channel:
             return None
-        
+
         try:
-            # 非阻塞读取
-            if self.ssh_channel.recv_ready():
-                data = b""
+            data = b""
+
+            # 阻塞等待数据，有数据立即返回
+            try:
+                chunk = self.ssh_channel.recv(1024)
+                if not chunk:
+                    # 连接已关闭
+                    return None
+                data += chunk
+
+                # 如果还有数据待读，继续读取（非阻塞）
                 while self.ssh_channel.recv_ready():
                     chunk = self.ssh_channel.recv(1024)
                     if not chunk:
                         break
                     data += chunk
-                
-                # 解析速度值
-                text = data.decode("utf-8", errors="ignore").strip()
-                lines = text.strip().split("\n")
-                
-                for line in reversed(lines):  # 取最后一行
-                    line = line.strip()
-                    if line:
-                        try:
-                            # 脚本输出的是 KB/s
-                            speed_kb = float(line)
-                            return speed_kb
-                        except ValueError:
-                            continue
-            
+            except socket.timeout:
+                # 超时是正常的，表示没有新数据，继续检查是否有已读取的数据
+                pass
+            except Exception as e:
+                # 其他错误可能是连接断开
+                self.logger.warn(f"SSH 读取异常: {e}", event="SSH_READ_WARN")
+                return None
+
+            if not data:
+                return None
+
+            # 解析速度值
+            text = data.decode("utf-8", errors="ignore").strip()
+            lines = text.strip().split("\n")
+
+            for line in reversed(lines):  # 取最后一行
+                line = line.strip()
+                if line:
+                    try:
+                        speed_kb = float(line)
+                        return speed_kb
+                    except ValueError:
+                        continue
+
             return None
-            
+
         except paramiko.SSHException as e:
             self.logger.error(f"SSH 读取错误: {e}", event="SSH_READ_ERROR", reason=str(e))
             return None
