@@ -14,10 +14,17 @@ import time
 import socket
 import signal
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 from collections import deque
+
+try:
+    from filelock import FileLock, Timeout
+except ImportError:
+    print("需要安装 filelock: pip install filelock")
+    sys.exit(1)
 
 try:
     import paramiko
@@ -51,16 +58,20 @@ class RouterSpeedSampler:
     ROUTER_USER = "xxhhlk"
     ROUTER_HOST = "192.168.2.1"
     ROUTER_PORT = 14033
-    ROUTER_SCRIPT = "/tmp/mnt/Test/entware/root/speed_num_only.sh"
+    ROUTER_SCRIPT = "/opt/root/speed_num_only.sh"
     SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
-    THRESHOLD_KB = 800
+    THRESHOLD_KB = 500
     CONSECUTIVE_SECONDS = 3
     INTERNET_FILTER_ID = 2  # Internet 区域 InternalId
     HISTORY_SECONDS = 10    # Internet 区域历史窗口大小（样本数）
     MAX_CONSECUTIVE_NL_ERRORS = 10  # NetLimiter 连续错误最大次数
+    SSH_RECONNECT_BASE_DELAY = 5  # SSH 重连基础延迟（秒）
+    SSH_RECONNECT_MAX_DELAY = 60  # SSH 重连最大延迟（秒）
 
     # 数据文件路径
     ROUTER_DATA_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.json"
+    ROUTER_LOCK_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.lock"
+    MAIN_LOOP_STALL_SECONDS = 60
     
     def __init__(self):
         self.logger = Logger("router_speed_sampler")
@@ -68,12 +79,14 @@ class RouterSpeedSampler:
         
         # 状态变量
         self.over_threshold_count = 0
+        self.below_threshold_count = 0  # 低于阈值连续秒数（用于禁用判定）
         self.sample_count = 0
         self.prev_router_speed_kb: Optional[float] = None
         self.last_sample_time: Optional[float] = None
         self.ssh_consecutive_failures = 0
         self.nl_consecutive_errors = 0
         self.running = True
+        self.last_ssh_reconnect_attempt: Optional[float] = None
         
         # SSH 客户端
         self.ssh_client: Optional[paramiko.SSHClient] = None
@@ -85,6 +98,9 @@ class RouterSpeedSampler:
         self.internet_history = deque(maxlen=self.HISTORY_SECONDS)
         self.previous_internet_out: Optional[int] = None
         self.previous_nl_sample_ts: Optional[float] = None
+        self._file_lock = FileLock(str(self.ROUTER_LOCK_FILE), timeout=5)
+        self._last_main_progress = time.monotonic()
+        self._progress_lock = threading.Lock()
         
         # 父进程检测
         self.supervisor_pid = os.environ.get("SUPERVISOR_PID")
@@ -94,6 +110,36 @@ class RouterSpeedSampler:
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         self.logger.info("初始化完成", event="INIT_OK")
+        self._start_watchdog()
+
+    def _touch_main_progress(self):
+        """记录主循环仍在推进；watchdog 用它识别主线程卡死。"""
+        with self._progress_lock:
+            self._last_main_progress = time.monotonic()
+
+    def _start_watchdog(self):
+        """监控主循环停摆，避免独立心跳掩盖主线程卡死。"""
+        thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name="router-main-loop-watchdog"
+        )
+        thread.start()
+
+    def _watchdog_loop(self):
+        while self.running:
+            time.sleep(5)
+            with self._progress_lock:
+                stalled_seconds = time.monotonic() - self._last_main_progress
+
+            if stalled_seconds > self.MAIN_LOOP_STALL_SECONDS:
+                self.logger.error(
+                    f"主循环 {stalled_seconds:.1f} 秒无进展，强制退出等待 supervisor 重启",
+                    event="WATCHDOG_STALLED",
+                    reason=f"{stalled_seconds:.1f}s"
+                )
+                self.heartbeat.stop()
+                os._exit(2)
     
     def _signal_handler(self, signum, frame):
         """信号处理器"""
@@ -270,9 +316,11 @@ class RouterSpeedSampler:
     
     def _connect_ssh(self) -> bool:
         """建立 SSH 连接"""
+        self.last_ssh_reconnect_attempt = time.time()
+
         try:
             self._cleanup_ssh()
-            
+
             self.logger.info(f"正在连接到路由器 {self.ROUTER_HOST}...", event="SSH_CONNECTING")
             
             # 创建 SSH 客户端
@@ -397,10 +445,11 @@ class RouterSpeedSampler:
         }
     
     def _save_router_data(
-        self, 
-        router_speed_kb: float, 
-        local_speed_kb: Optional[float], 
-        over_threshold_seconds: int
+        self,
+        router_speed_kb: float,
+        local_speed_kb: Optional[float],
+        over_threshold_seconds: int,
+        below_threshold_seconds: int
     ):
         """保存路由器数据"""
         try:
@@ -408,14 +457,18 @@ class RouterSpeedSampler:
                 "RouterSpeedKB": router_speed_kb,
                 "LocalSpeedKB": local_speed_kb,
                 "OverThresholdSeconds": over_threshold_seconds,
+                "BelowThresholdSeconds": below_threshold_seconds,
                 "LastUpdate": datetime.now().isoformat()
             }
             
-            # 原子写入
-            tmp_file = self.ROUTER_DATA_FILE.with_suffix(".tmp")
-            tmp_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            tmp_file.replace(self.ROUTER_DATA_FILE)
+            # 使用跨进程锁，避免 Windows 上 reader/writer 抢占导致 PermissionError。
+            with self._file_lock:
+                tmp_file = Path(f"{self.ROUTER_DATA_FILE}.{os.getpid()}.tmp")
+                tmp_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp_file, self.ROUTER_DATA_FILE)
             
+        except Timeout:
+            self.logger.error("获取路由器数据文件锁超时", event="SAVE_LOCK_TIMEOUT")
         except Exception as e:
             self.logger.error(f"保存路由器数据失败: {e}", event="SAVE_ERROR", reason=str(e))
     
@@ -465,6 +518,9 @@ class RouterSpeedSampler:
         
         while self.running:
             try:
+                self._touch_main_progress()
+                self.heartbeat.increment_loop()
+
                 # 检查父进程
                 if not self._check_parent_alive():
                     self.logger.info("父进程已退出，准备退出", event="PARENT_EXIT")
@@ -472,6 +528,10 @@ class RouterSpeedSampler:
                 
                 # 读取路由器速度
                 router_speed = self._read_router_speed()
+                if not self.running:
+                    break
+                self._touch_main_progress()
+
                 current_time = time.time()
                 
                 if router_speed is not None:
@@ -479,6 +539,7 @@ class RouterSpeedSampler:
                     
                     # 采集本机 Internet 区域速度
                     local_internet_speed = self._sample_internet_speed()
+                    self._touch_main_progress()
                     
                     # 使用当前路由器速度进行实时比较（不延迟）
                     comparison = self._compare_speeds(
@@ -489,18 +550,21 @@ class RouterSpeedSampler:
                     # 保存当前路由器速度
                     self.prev_router_speed_kb = router_speed
                     
-                    # 检查阈值：差值 > 800KB/s
+                    # 检查阈值：差值 > THRESHOLD_KB
                     speed_diff = comparison.get("Diff")
                     if speed_diff is not None and speed_diff > self.THRESHOLD_KB:
                         self.over_threshold_count += 1
+                        self.below_threshold_count = 0  # 超阈值时重置低于阈值计数
                     else:
                         self.over_threshold_count = 0
+                        self.below_threshold_count += 1  # 低于阈值时累加
                     
                     # 保存数据
                     self._save_router_data(
                         router_speed,
                         comparison.get("LocalSpeed"),
-                        self.over_threshold_count
+                        self.over_threshold_count,
+                        self.below_threshold_count
                     )
                     
                     # 日志输出
@@ -536,7 +600,25 @@ class RouterSpeedSampler:
                         )
                 
                 # 检查 SSH 连接状态
-                if self.ssh_channel is None or self.ssh_channel.closed:
+                if self.running and (self.ssh_channel is None or self.ssh_channel.closed):
+                    # 计算重连延迟（指数退避）
+                    delay = min(
+                        self.SSH_RECONNECT_BASE_DELAY * (2 ** min(self.ssh_consecutive_failures, 4)),
+                        self.SSH_RECONNECT_MAX_DELAY
+                    )
+
+                    # 检查是否需要等待
+                    now = time.time()
+                    if self.last_ssh_reconnect_attempt is not None:
+                        elapsed = now - self.last_ssh_reconnect_attempt
+                        if elapsed < delay:
+                            remaining = delay - elapsed
+                            self.logger.info(
+                                f"等待 {remaining:.1f}s 后重试 SSH 连接 (失败 {self.ssh_consecutive_failures} 次)",
+                                event="SSH_WAIT_RETRY"
+                            )
+                            time.sleep(remaining)
+
                     self.logger.warn("SSH 连接已断开，尝试重连...", event="SSH_RECONNECT")
                     self._connect_ssh()
                 

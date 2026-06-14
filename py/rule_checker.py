@@ -16,6 +16,12 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+try:
+    from filelock import FileLock, Timeout
+except ImportError:
+    print("需要安装 filelock: pip install filelock")
+    sys.exit(1)
+
 NETLIMITER_DLL_PATH = r"C:\Program Files\Locktime Software\NetLimiter\NetLimiter.dll"
 try:
     import clr
@@ -51,6 +57,7 @@ class RuleChecker:
     
     # 路由器速度检查配置
     ROUTER_RULE_ID = "5b34aebb-191d-439c-a3e4-33a918905ac6"
+    ROUTER_THRESHOLD_KB = 500  # 路由器规则阈值（与 router_sampler 一致）
     ROUTER_CONSECUTIVE_SECONDS = 3
     ROUTER_CHECK_INTERVAL_SECONDS = 2
 
@@ -83,8 +90,13 @@ class RuleChecker:
         self._last_rule_change_time: Optional[float] = None
         self._last_router_rule_change_time: Optional[float] = None
 
+        # 低于阈值连续时间跟踪（用于禁用判定）
+        self._below_threshold_since: Optional[float] = None
+
         # NetLimiter 客户端
         self.client: Optional[NLClient] = None
+        self._data_file_lock = FileLock(str(self.LOCK_FILE), timeout=1)
+        self._router_file_lock = FileLock(str(self.ROUTER_LOCK_FILE), timeout=1)
 
         # 规则缓存（避免每次线性搜索）
         self._rule_cache: Dict[str, Any] = {}
@@ -297,16 +309,16 @@ class RuleChecker:
     def _get_data(self) -> Optional[Dict[str, Any]]:
         """读取速度数据"""
         try:
-            # 检查锁文件
-            if self.LOCK_FILE.exists():
-                time.sleep(0.05)
-            
             if not self.DATA_FILE.exists():
                 return None
             
-            data = json.loads(self.DATA_FILE.read_text(encoding="utf-8"))
+            with self._data_file_lock:
+                data = json.loads(self.DATA_FILE.read_text(encoding="utf-8"))
             return data
             
+        except Timeout:
+            self.logger.warn("读取速度数据获取文件锁超时，跳过本轮", event="DATA_READ_LOCK_TIMEOUT")
+            return None
         except Exception as e:
             self.logger.error(f"读取速度数据失败: {e}", event="DATA_READ_ERROR")
             return None
@@ -314,16 +326,16 @@ class RuleChecker:
     def _get_router_data(self) -> Optional[Dict[str, Any]]:
         """读取路由器数据"""
         try:
-            # 检查锁文件
-            if self.ROUTER_LOCK_FILE.exists():
-                time.sleep(0.05)
-            
             if not self.ROUTER_DATA_FILE.exists():
                 return None
             
-            data = json.loads(self.ROUTER_DATA_FILE.read_text(encoding="utf-8"))
+            with self._router_file_lock:
+                data = json.loads(self.ROUTER_DATA_FILE.read_text(encoding="utf-8"))
             return data
             
+        except Timeout:
+            self.logger.warn("读取路由器数据获取文件锁超时，跳过本轮", event="ROUTER_DATA_READ_LOCK_TIMEOUT")
+            return None
         except Exception as e:
             self.logger.error(f"读取路由器数据失败: {e}", event="ROUTER_DATA_READ_ERROR")
             return None
@@ -401,18 +413,41 @@ class RuleChecker:
                     event="RULE_ENABLED"
                 )
             elif avg_speed_kb < self.THRESHOLD_KB and rule_enabled:
-                rule.IsEnabled = False
-                self.client.UpdateRule(rule)  # type: ignore
-                # 清除缓存，强制下次重新获取以验证
-                self._rule_cache.pop(self.LIMIT_RULE_ID, None)
-                # 记录规则变更时间，触发冷却
-                self._last_rule_change_time = time.time()
-                cooldown_end = self._last_rule_change_time + self.COOLDOWN_SECONDS
-                self.logger.info(
-                    f"Qbit规则 状态变更: 已禁用 | 平均速度={avg_speed_kb} KB/s < 阈值={self.THRESHOLD_KB} KB/s | "
-                    f"冷却期至{datetime.fromtimestamp(cooldown_end).strftime('%H:%M:%S')}",
-                    event="RULE_DISABLED"
-                )
+                # 记录低于阈值的开始时间
+                if self._below_threshold_since is None:
+                    self._below_threshold_since = time.time()
+                    elapsed = 0
+                else:
+                    elapsed = time.time() - self._below_threshold_since
+
+                # 只有连续低于阈值 90 秒才禁用
+                if elapsed >= 90:
+                    rule.IsEnabled = False
+                    self.client.UpdateRule(rule)  # type: ignore
+                    # 清除缓存，强制下次重新获取以验证
+                    self._rule_cache.pop(self.LIMIT_RULE_ID, None)
+                    # 记录规则变更时间，触发冷却
+                    self._last_rule_change_time = time.time()
+                    cooldown_end = self._last_rule_change_time + self.COOLDOWN_SECONDS
+                    # 重置低于阈值计时
+                    self._below_threshold_since = None
+                    self.logger.info(
+                        f"Qbit规则 状态变更: 已禁用 | 平均速度={avg_speed_kb} KB/s < 阈值={self.THRESHOLD_KB} KB/s | "
+                        f"连续低于阈值 {elapsed:.0f} 秒 | "
+                        f"冷却期至{datetime.fromtimestamp(cooldown_end).strftime('%H:%M:%S')}",
+                        event="RULE_DISABLED"
+                    )
+                else:
+                    # 未满 90 秒，仅记录状态
+                    self.logger.info(
+                        f"Qbit规则 低于阈值累计 {elapsed:.0f}/90 秒 | 平均速度={avg_speed_kb} KB/s",
+                        event="QBIT_BELOW_THRESHOLD"
+                    )
+            elif avg_speed_kb >= self.THRESHOLD_KB:
+                # 速度恢复到阈值以上，重置低于阈值计时
+                if self._below_threshold_since is not None:
+                    self._below_threshold_since = None
+                    self.logger.info("Qbit规则 低于阈值计时已重置", event="QBIT_THRESHOLD_RESET")
 
             # 成功执行，重置错误计数
             self._consecutive_errors = 0
@@ -444,11 +479,12 @@ class RuleChecker:
 
             router_speed_kb = router_data.get("RouterSpeedKB")
             over_threshold_seconds = router_data.get("OverThresholdSeconds", 0)
+            below_threshold_seconds = router_data.get("BelowThresholdSeconds", 0)
 
-            # 获取本机最近10秒平均速度进行比较
-            local_avg_speed_kb = self._get_local_avg_speed_kb()
+            # Use the local Internet speed captured in the same router sampling loop.
+            local_avg_speed_kb = router_data.get("LocalSpeedKB")
             if local_avg_speed_kb is None:
-                self.logger.warn("本机速度数据无效，跳过路由器规则检查", event="ROUTER_CHECK_SKIP")
+                self.logger.warn("路由器采样中的本机速度数据无效，跳过路由器规则检查", event="ROUTER_CHECK_SKIP")
                 return
 
             # 差值计算：路由器速度 - 本机平均速度
@@ -464,7 +500,7 @@ class RuleChecker:
             rule_enabled = rule.IsEnabled
 
             # 连续超过阈值指定秒数，启用规则
-            if speed_diff > self.THRESHOLD_KB and over_threshold_seconds >= self.ROUTER_CONSECUTIVE_SECONDS and not rule_enabled:
+            if speed_diff > self.ROUTER_THRESHOLD_KB and over_threshold_seconds >= self.ROUTER_CONSECUTIVE_SECONDS and not rule_enabled:
                 rule.IsEnabled = True
                 self.client.UpdateRule(rule)  # type: ignore
                 # 清除缓存，强制下次重新获取以验证
@@ -474,11 +510,12 @@ class RuleChecker:
                 cooldown_end = self._last_router_rule_change_time + self.COOLDOWN_SECONDS
                 self.logger.info(
                     f"路由器规则 状态变更: 已启用 | 路由器速度={router_speed_kb} KB/s, 本机平均={local_avg_speed_kb} KB/s, "
-                    f"差值={speed_diff:.2f} KB/s > 阈值={self.THRESHOLD_KB} KB/s, 连续超阈值={over_threshold_seconds}秒 | "
+                    f"差值={speed_diff:.2f} KB/s > 阈值={self.ROUTER_THRESHOLD_KB} KB/s, 连续超阈值={over_threshold_seconds}秒 | "
                     f"冷却期至{datetime.fromtimestamp(cooldown_end).strftime('%H:%M:%S')}",
                     event="ROUTER_RULE_ENABLED"
                 )
-            elif (speed_diff <= self.THRESHOLD_KB or over_threshold_seconds < self.ROUTER_CONSECUTIVE_SECONDS) and rule_enabled:
+            elif below_threshold_seconds >= 90 and rule_enabled:
+                # 连续低于阈值 90 秒，禁用规则
                 rule.IsEnabled = False
                 self.client.UpdateRule(rule)  # type: ignore
                 # 清除缓存，强制下次重新获取以验证
@@ -488,7 +525,7 @@ class RuleChecker:
                 cooldown_end = self._last_router_rule_change_time + self.COOLDOWN_SECONDS
                 self.logger.info(
                     f"路由器规则 状态变更: 已禁用 | 路由器速度={router_speed_kb} KB/s, 本机平均={local_avg_speed_kb} KB/s, "
-                    f"差值={speed_diff:.2f} KB/s <= 阈值={self.THRESHOLD_KB} KB/s 或 连续超阈值={over_threshold_seconds}秒 < 要求={self.ROUTER_CONSECUTIVE_SECONDS}秒 | "
+                    f"差值={speed_diff:.2f} KB/s | 连续低于阈值 {below_threshold_seconds} 秒 | "
                     f"冷却期至{datetime.fromtimestamp(cooldown_end).strftime('%H:%M:%S')}",
                     event="ROUTER_RULE_DISABLED"
                 )
