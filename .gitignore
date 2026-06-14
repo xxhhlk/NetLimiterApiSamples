@@ -1,5 +1,15 @@
 ## BEGIN: My ignores
 
+# Qwen Code
+.qwen/
+MEMORY.md
+plans/
+
+# PowerShell scripts (local tools)
+ps/*.ps1
+ps/*.lnk
+ps/*.bat
+
 # Python logs
 py/logs/
 
