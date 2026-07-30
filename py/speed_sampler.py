@@ -12,6 +12,7 @@ import os
 import time
 import json
 import signal
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -87,7 +88,31 @@ class SpeedSampler:
         # 设置信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
+        # 启动 watchdog 线程（检测父进程退出，避免成为孤儿进程）
+        self._start_watchdog()
+
+    def _start_watchdog(self):
+        """启动 watchdog 线程，检测父进程退出"""
+        thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name="speed-sampler-watchdog"
+        )
+        thread.start()
+
+    def _watchdog_loop(self):
+        """watchdog：独立线程检测父进程是否存活，避免主循环卡在 API 调用里时成为孤儿"""
+        while self.running:
+            time.sleep(5)
+            if not self._check_parent_alive():
+                self.logger.error(
+                    "父进程(supervisor)已退出，watchdog 强制终止本进程",
+                    event="WATCHDOG_PARENT_EXIT"
+                )
+                self.heartbeat.stop()
+                os._exit(2)
+
     def _signal_handler(self, signum, frame):
         """信号处理器"""
         self.logger.info("收到停止信号，正在关闭...", event="SIGNAL", reason=str(signum))
@@ -350,8 +375,15 @@ class SpeedSampler:
         try:
             os.kill(int(supervisor_pid), 0)
             return True
-        except (OSError, ProcessLookupError):
+        except ProcessLookupError:
+            # 进程不存在
             return False
+        except PermissionError:
+            # 进程存在但无权限（管理员子进程检查普通父进程），视为存活
+            return True
+        except OSError:
+            # 其他 OS 错误，保守视为存活，避免误判
+            return True
     
     def run(self):
         """主循环"""

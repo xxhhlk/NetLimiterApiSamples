@@ -92,6 +92,10 @@ class ModuleProcess:
     
     def start(self):
         """启动进程"""
+        # 设置 SUPERVISOR_PID 环境变量，子进程通过它检测父进程是否存活
+        # multiprocessing.Process 会继承父进程环境变量
+        os.environ["SUPERVISOR_PID"] = str(os.getpid())
+
         self.process = mp.Process(
             target=self.target_func,
             name=self.name,
@@ -100,7 +104,7 @@ class ModuleProcess:
         self.process.start()
         self.start_time = datetime.now()
         self.logger.info(
-            f"启动模块: {self.name}, PID: {self.process.pid}",
+            f"启动模块: {self.name}, PID: {self.process.pid}, SupervisorPID: {os.getpid()}",
             event="MODULE_START"
         )
     
@@ -114,12 +118,24 @@ class ModuleProcess:
             self.logger.info(f"终止模块: {self.name}", event="MODULE_TERMINATE")
             self.process.terminate()
             self.process.join(timeout=timeout)
-            
+
             # 如果 terminate 无效，使用 kill
             if self.process.is_alive():
                 self.logger.warn(f"强制终止模块: {self.name}", event="MODULE_KILL")
                 self.process.kill()
                 self.process.join(timeout=1)
+
+            # 如果 kill 仍无效（进程卡在 CLR/native 调用里），用 taskkill /F 强制终止
+            if self.process.is_alive():
+                import subprocess
+                pid = self.process.pid
+                self.logger.warn(f"taskkill 强制终止模块: {self.name} (pid={pid})", event="MODULE_TASKKILL")
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, timeout=5)
+                    self.process.join(timeout=2)
+                except Exception as e:
+                    self.logger.error(f"taskkill 失败: {e}", event="MODULE_TASKKILL_FAIL")
     
     def restart(self):
         """重启进程"""
@@ -154,7 +170,7 @@ class Supervisor:
         self.logger = Logger("supervisor")
         self.modules: Dict[str, ModuleProcess] = {}
         self.running = True
-        self.monitor_interval = 5  # 监控间隔（秒）
+        self.monitor_interval = 12  # 监控间隔（秒）
         
         # 设置信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)

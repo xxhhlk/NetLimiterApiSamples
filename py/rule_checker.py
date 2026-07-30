@@ -12,6 +12,7 @@ import json
 import time
 import signal
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -49,15 +50,15 @@ class RuleChecker:
     
     # qBittorrent 限速规则配置
     LIMIT_RULE_ID = "f4c3e3ac-91d1-435b-af27-f9020b4eab4e"
-    THRESHOLD_KB = 400
+    THRESHOLD_KB = 600
     CHECK_INTERVAL_SECONDS = 20
     FIRST_CHECK_DELAY_SECONDS = 5
     RETRY_INTERVAL_SECONDS = 10
     MAX_RETRY_COUNT = 5
     
     # 路由器速度检查配置
-    ROUTER_RULE_ID = "5b34aebb-191d-439c-a3e4-33a918905ac6"
-    ROUTER_THRESHOLD_KB = 500  # 路由器规则阈值（与 router_sampler 一致）
+    ROUTER_RULE_ID = "d36d9bf8-02f1-41d1-9d89-be65b2d4360a"
+    ROUTER_THRESHOLD_KB = 800  # 路由器规则阈值（与 router_sampler 一致）
     ROUTER_CONSECUTIVE_SECONDS = 3
     ROUTER_CHECK_INTERVAL_SECONDS = 2
 
@@ -111,9 +112,33 @@ class RuleChecker:
         # 设置信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-        
+
+        # 启动 watchdog 线程（检测父进程退出，避免成为孤儿进程）
+        self._start_watchdog()
+
         self.logger.info("初始化完成", event="INIT_OK")
-    
+
+    def _start_watchdog(self):
+        """启动 watchdog 线程，检测父进程退出"""
+        thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name="rule-checker-watchdog"
+        )
+        thread.start()
+
+    def _watchdog_loop(self):
+        """watchdog：独立线程检测父进程是否存活，避免主循环卡在 API 调用里时成为孤儿"""
+        while self.running:
+            time.sleep(5)
+            if not self._check_parent_alive():
+                self.logger.error(
+                    "父进程(supervisor)已退出，watchdog 强制终止本进程",
+                    event="WATCHDOG_PARENT_EXIT"
+                )
+                self.heartbeat.stop()
+                os._exit(2)
+
     def _signal_handler(self, signum, frame):
         """信号处理器"""
         self.logger.info(f"收到信号 {signum}，准备退出", event="SIGNAL", reason=str(signum))
@@ -198,8 +223,15 @@ class RuleChecker:
         try:
             os.kill(int(self.supervisor_pid), 0)
             return True
-        except (OSError, ProcessLookupError):
+        except ProcessLookupError:
+            # 进程不存在
             return False
+        except PermissionError:
+            # 进程存在但无权限（管理员子进程检查普通父进程），视为存活
+            return True
+        except OSError:
+            # 其他 OS 错误，保守视为存活，避免误判
+            return True
     
     def _is_admin(self) -> bool:
         """检查是否以管理员权限运行"""
