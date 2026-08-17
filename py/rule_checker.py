@@ -61,6 +61,7 @@ class RuleChecker:
     ROUTER_THRESHOLD_KB = 800  # 路由器规则阈值（与 router_sampler 一致）
     ROUTER_CONSECUTIVE_SECONDS = 3
     ROUTER_CHECK_INTERVAL_SECONDS = 2
+    ROUTER_BELOW_THRESHOLD_SECONDS = 10  # 连续低于阈值 10 秒后恢复网速
 
     # 冷却机制：触发规则后间隔变为3倍，60秒后恢复
     COOLDOWN_MULTIPLIER = 3
@@ -546,8 +547,8 @@ class RuleChecker:
                     f"冷却期至{datetime.fromtimestamp(cooldown_end).strftime('%H:%M:%S')}",
                     event="ROUTER_RULE_ENABLED"
                 )
-            elif below_threshold_seconds >= 90 and rule_enabled:
-                # 连续低于阈值 90 秒，禁用规则
+            elif below_threshold_seconds >= self.ROUTER_BELOW_THRESHOLD_SECONDS and rule_enabled:
+                # 连续低于阈值指定秒数，禁用规则
                 rule.IsEnabled = False
                 self.client.UpdateRule(rule)  # type: ignore
                 # 清除缓存，强制下次重新获取以验证
