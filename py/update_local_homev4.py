@@ -13,9 +13,10 @@ local-homev4 的 远程地址范围(FFRemoteAddressInRange)，范围语义为单
 （对比 v6：本机通过 SLAAC 直接持有公网前缀，才需要本地范围）。若过滤器中
 残留了本地地址范围函数，脚本会将其移除。
 
-检测：多源并发查询 + 一致性比对（3 主源 ip.sb/ipify/3322.net + 2 备用源 ipip.net/pconline），
-所有源统一走 IPv4 直连（强制 A 记录解析 + 绕过环境代理），
-任一源超时/失败不阻塞，多源结果不一致时明确报错。
+检测：分级多源查询 + 一致性比对。首次并发请求 3 个主源（ip.sb/ipify/3322.net），
+主源中 ≥2 个返回同一 IP 即直接采纳；主源不足（<2 一致或结果不一致）才追加
+2 个备用源（ipip.net/pconline）交叉验证。所有源统一走 IPv4 直连
+（强制 A 记录解析 + 绕过环境代理），单源超时 5s，失败不阻塞。
 
 用法（写入 NetLimiter 需要管理员权限）：
     python py/update_local_homev4.py              # 查询并更新（过滤器不存在则自动创建）
@@ -38,21 +39,21 @@ from concurrent.futures import ThreadPoolExecutor
 NETLIMITER_DLL_PATH = r"C:\Program Files\Locktime Software\NetLimiter\NetLimiter.dll"
 ZONE_FILTER_NAME = "local-homev4"
 
-# 出口 IP 查询源（并发）。所有源统一走 IPv4 直连（见 query_source），
+# 出口 IP 查询源（分级）。所有源统一走 IPv4 直连（见 query_source），
 # 因此不依赖源端点本身是否为强制 v4。两条硬约束：
 # 1) 必须绕过环境代理强制直连——否则国外源被本地代理分流到代理出口（如阿里云香港），
 #    拿不到家庭宽带真实 IP。
 # 2) 客户端有 IPv6 时双栈源优先返回 IPv6，对 IPv4 检测无效——所以 DNS 只解析 A 记录。
-IP_SOURCES = {
-    # 主源
+MAIN_SOURCES = {
     "ip.sb": "https://api-ipv4.ip.sb/ip",
     "ipify": "https://api.ipify.org/",
     "3322.net": "https://ip.3322.net/",
-    # 备用源（国内，国外源 ipify 在部分网络直连不通时兜底）
+}
+BACKUP_SOURCES = {
     "ipip.net": "https://myip.ipip.net/",
     "pconline": "https://whois.pconline.com.cn/ipJson.jsp",
 }
-DEFAULT_TIMEOUT = 8
+DEFAULT_TIMEOUT = 5
 
 # ---------------------------------------------------------------------------
 # NetLimiter API 加载
@@ -145,44 +146,75 @@ def query_source(name: str, url: str, timeout: int):
         return name, None
 
 
-def detect_public_ipv4(timeout: int = DEFAULT_TIMEOUT):
+def _query_many(sources: dict, timeout: int) -> dict:
+    """并发查询一组源，打印每个源的结果行，返回 {源名: ip 或 None}"""
+    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        futures = {ex.submit(query_source, n, u, timeout): n for n, u in sources.items()}
+        results = {futures[f]: f.result()[1] for f in futures}
+    for n in sources:
+        ip = results.get(n)
+        print(f"  {n:<10} -> {ip if ip else '[失败/无响应]'}")
+    return results
+
+
+def _judge(results: dict):
     """
-    多源并发查询出口 IPv4。
+    对结果做一致性判定。
 
     Returns:
-        (ip, source_detail) — source_detail 形如 "ip.sb,ipip.net(2源一致)" 或
-        "ip.sb(单源)"；多源结果不一致或全部失败时 ip 为 None。
+        (ip, detail) — 成功返回唯一 IP 与来源描述；
+        全部失败或不一致（存在多个不同 IP）时返回 (None, "")。
     """
-    print(f"[查询] 并发请求 {len(IP_SOURCES)} 个源: {', '.join(IP_SOURCES)} (超时 {timeout}s)")
-    with ThreadPoolExecutor(max_workers=len(IP_SOURCES)) as ex:
-        futures = {ex.submit(query_source, n, u, timeout): n for n, u in IP_SOURCES.items()}
-        results = {futures[f]: f.result()[1] for f in futures}
-
     ok = {n: ip for n, ip in results.items() if ip}
-    for n in IP_SOURCES:
-        if n in ok:
-            print(f"  {n:<9} -> {ok[n]}")
-        else:
-            print(f"  {n:<9} -> [失败/无响应]")
-
     if not ok:
-        print("[失败] 所有查询源均不可用（网络不通或被墙），请检查出口网络")
         return None, ""
-
     uniq = {}
     for ip in set(ok.values()):
         uniq[ip] = [n for n, v in ok.items() if v == ip]
-
     if len(uniq) > 1:
-        print("[失败] 多源结果不一致，拒绝更新：")
-        for ip, names in uniq.items():
-            print(f"  {ip}  <- {','.join(names)}")
-        return None, ""
-
+        return None, ""  # 不一致
     ip = next(iter(uniq))
     names = uniq[ip]
     detail = f"{','.join(names)}({len(names)}源一致)" if len(names) > 1 else f"{names[0]}(单源)"
     return ip, detail
+
+
+def detect_public_ipv4(timeout: int = DEFAULT_TIMEOUT):
+    """
+    分级查询出口 IPv4：先请求 3 个主源，主源中 ≥2 个一致即采纳；
+    主源不足（<2 一致）或结果不一致时，追加请求 2 个备用源交叉验证。
+
+    Returns:
+        (ip, source_detail) — source_detail 形如 "ip.sb,3322.net(2源一致)" 或
+        "ip.sb(单源)"；全部失败或合并后仍不一致时 ip 为 None。
+    """
+    print(f"[查询] 首次请求 {len(MAIN_SOURCES)} 个主源: {', '.join(MAIN_SOURCES)} (超时 {timeout}s)")
+    results = _query_many(MAIN_SOURCES, timeout)
+    ok_count = sum(1 for v in results.values() if v)
+
+    ip, detail = _judge(results)
+    if ip and ok_count >= 2:
+        return ip, detail
+
+    # 主源不足或结果不一致 → 追加备用源
+    print(f"[查询] 主源结果不足（成功 {ok_count}/{len(MAIN_SOURCES)}），"
+          f"追加备用源: {', '.join(BACKUP_SOURCES)}")
+    results.update(_query_many(BACKUP_SOURCES, timeout))
+
+    ip, detail = _judge(results)
+    if ip:
+        return ip, detail
+
+    if not any(results.values()):
+        print("[失败] 所有查询源均不可用（网络不通或被墙），请检查出口网络")
+    else:
+        print("[失败] 多源结果不一致，拒绝更新：")
+        uniq = {}
+        for ipv in set(v for v in results.values() if v):
+            uniq[ipv] = [n for n, v in results.items() if v == ipv]
+        for ipv, names in uniq.items():
+            print(f"  {ipv}  <- {','.join(names)}")
+    return None, ""
 
 
 # ---------------------------------------------------------------------------
