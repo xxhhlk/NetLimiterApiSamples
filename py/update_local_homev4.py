@@ -5,10 +5,16 @@ update_local_homev4.py — 获取当前公网 IPv4，同步到 NetLimiter 区域
 
 背景：路由器 PPPoE 拨号（PC 在内网，本机网卡没有公网 IPv4），出口 IP 只能通过
 外部 API 查询。宽带重拨后出口 IPv4 可能变化，本脚本将其写入区域过滤器
-local-homev4 的 远程地址范围(FFRemoteAddressInRange) 与 本地地址范围(FFLocalAddressInRange)，
-范围语义为单地址（start == end == 公网 IPv4）。
+local-homev4 的 远程地址范围(FFRemoteAddressInRange)，范围语义为单地址
+（start == end == 公网 IPv4）。
 
-检测：多源并发查询 + 一致性比对（ip.sb / myip.ipip.net / ipify.org），
+注意：v4 过滤器只配置远程地址范围。本机在 NAT 后面只有私网地址（如 192.168.x.x），
+公网 IPv4 永远不会作为本地源地址出现，所以不需要 FFLocalAddressInRange
+（对比 v6：本机通过 SLAAC 直接持有公网前缀，才需要本地范围）。若过滤器中
+残留了本地地址范围函数，脚本会将其移除。
+
+检测：多源并发查询 + 一致性比对（ip.sb / ipify / 3322.net / ident.me），
+所有源统一走 IPv4 直连（强制 A 记录解析 + 绕过环境代理），
 任一源超时/失败不阻塞，多源结果不一致时明确报错。
 
 用法（写入 NetLimiter 需要管理员权限）：
@@ -17,24 +23,26 @@ local-homev4 的 远程地址范围(FFRemoteAddressInRange) 与 本地地址范�
     python py/update_local_homev4.py --force      # IP 未变化时也强制更新
     python py/update_local_homev4.py --name myv4  # 指定过滤器名称
 
-依赖：标准库 urllib / concurrent.futures；pythonnet（写入 NetLimiter）。
+依赖：标准库 socket / ssl / http.client / concurrent.futures；pythonnet（写入 NetLimiter）。
 """
 
 import argparse
 import ipaddress
 import re
+import socket
+import ssl
 import sys
-import urllib.request
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 NETLIMITER_DLL_PATH = r"C:\Program Files\Locktime Software\NetLimiter\NetLimiter.dll"
 ZONE_FILTER_NAME = "local-homev4"
 
-# 出口 IP 查询源（并发）。两条硬约束：
+# 出口 IP 查询源（并发）。所有源统一走 IPv4 直连（见 query_source），
+# 因此不依赖源端点本身是否为强制 v4。两条硬约束：
 # 1) 必须绕过环境代理强制直连——否则国外源被本地代理分流到代理出口（如阿里云香港），
 #    拿不到家庭宽带真实 IP。
-# 2) 必须强制 IPv4——双栈源（myip.ipip.net、ifconfig.me 等）在客户端有 IPv6 时
-#    优先返回 IPv6，对 IPv4 检测无效。
+# 2) 客户端有 IPv6 时双栈源优先返回 IPv6，对 IPv4 检测无效——所以 DNS 只解析 A 记录。
 IP_SOURCES = {
     "ip.sb": "https://api-ipv4.ip.sb/ip",
     "ipify": "https://api.ipify.org/",
@@ -86,23 +94,50 @@ def load_nl_api() -> bool:
 # 出口 IPv4 检测
 # ---------------------------------------------------------------------------
 def query_source(name: str, url: str, timeout: int):
-    """查询单个源，返回 (name, ip 或 None)；异常/超时返回 None"""
+    """
+    查询单个源，返回 (name, ip 或 None)；异常/超时返回 None。
+
+    统一强制 IPv4 直连：
+    - DNS 只解析 A 记录（AF_INET），避免双栈客户端拿到源返回的 IPv6；
+    - 直接与 IPv4 地址建连（不读环境代理），避免被本地代理分流到代理出口；
+    - TLS 握手用 server_hostname 保留 SNI 与证书校验（http.client 无法注入
+      已连接 socket 且其 SNI 取 self.host，因此用原始 socket 手动发请求）。
+    """
     try:
-        # 强制直连：绕过 HTTP_PROXY/HTTPS_PROXY 环境变量，避免被本地代理分流
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0"})
-        with opener.open(req, timeout=timeout) as resp:
-            text = resp.read().decode("utf-8", "replace")
-        m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
-        if not m:
-            return name, None
-        ip = m.group(1)
-        # 合法性校验（同时排除 255.255.255.255 等）
-        try:
-            addr = ipaddress.ip_address(ip)
-            return name, str(addr) if addr.version == 4 else None
-        except ValueError:
-            return name, None
+        p = urllib.parse.urlparse(url)
+        host = p.hostname
+        port = p.port or 443
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+
+        # 只取 IPv4 (A 记录)，按顺序逐个尝试
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        ctx = ssl.create_default_context()
+        for _, _, _, _, addr in infos:
+            try:
+                raw = socket.create_connection((addr[0], port), timeout=timeout)
+                with ctx.wrap_socket(raw, server_hostname=host) as ssock:
+                    req = (f"GET {path} HTTP/1.1\r\n"
+                           f"Host: {host}\r\n"
+                           f"User-Agent: curl/8.4.0\r\n"
+                           f"Connection: close\r\n\r\n")
+                    ssock.sendall(req.encode())
+                    buf = b""
+                    while True:
+                        chunk = ssock.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                text = buf.decode("utf-8", "replace")
+                m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
+                if not m:
+                    return name, None
+                addr_obj = ipaddress.ip_address(m.group(1))
+                return name, str(addr_obj) if addr_obj.version == 4 else None
+            except Exception:
+                continue  # 换下一个 A 记录
+        return name, None
     except Exception:
         return name, None
 
@@ -160,54 +195,55 @@ def find_filter_by_name(client, name: str):
     return None
 
 
-# 区域过滤器应包含的两种地址范围函数
-ZONE_FUNCTIONS = {
-    "NetLimiter.Service.FFRemoteAddressInRange": "FFRemoteAddressInRange",
-    "NetLimiter.Service.FFLocalAddressInRange": "FFLocalAddressInRange",
-}
+# v4 过滤器只配置远程地址范围（NAT 后公网 IP 不可能是本地源地址）
+REMOTE_FN = "NetLimiter.Service.FFRemoteAddressInRange"
+LOCAL_FN = "NetLimiter.Service.FFLocalAddressInRange"
 
 
 def update_zone_filter(client, filt, ip: str, force: bool) -> bool:
     """
-    更新区域过滤器的远程/本地地址范围为单地址 ip-ip；
-    缺失的地址范围函数会自动补全（如只配了远程范围的手动过滤器）。
+    将远程地址范围更新为单地址 ip-ip；移除无意义的本地地址范围函数
+    （本机在 NAT 后面只有私网地址，公网 IPv4 不会作为本地源地址出现）。
     返回是否发生写入。
     """
     changed = False
-    present = set()
+    found_remote = False
+    to_remove = []
 
     for fn in filt.Functions:  # type: ignore
         full = str(fn.GetType().FullName)
-        if full not in ZONE_FUNCTIONS:
-            continue
-        present.add(full)
-        cur = None
-        if fn.Values.Count > 0:  # type: ignore
-            v = fn.Values[0]  # type: ignore
-            cur = f"{v.Range.Start} - {v.Range.End}"
-        if not force and cur == f"{ip} - {ip}":
-            print(f"  - {ZONE_FUNCTIONS[full]}: 已是最新，跳过 ({ip} - {ip})")
-            continue
-        fn.Values.Clear()  # type: ignore
-        fn.Values.Add(IPRangeFilterValue(ip, ip))  # type: ignore
-        changed = True
-        print(f"  + {ZONE_FUNCTIONS[full]}: {cur}  ->  {ip} - {ip}")
+        if full == REMOTE_FN:
+            found_remote = True
+            cur = None
+            if fn.Values.Count > 0:  # type: ignore
+                v = fn.Values[0]  # type: ignore
+                cur = f"{v.Range.Start} - {v.Range.End}"
+            if not force and cur == f"{ip} - {ip}":
+                print(f"  - FFRemoteAddressInRange: 已是最新，跳过 ({ip} - {ip})")
+                continue
+            fn.Values.Clear()  # type: ignore
+            fn.Values.Add(IPRangeFilterValue(ip, ip))  # type: ignore
+            changed = True
+            print(f"  + FFRemoteAddressInRange: {cur}  ->  {ip} - {ip}")
+        elif full == LOCAL_FN:
+            to_remove.append(fn)
 
-    # 补全缺失的地址范围函数
-    for full, short in ZONE_FUNCTIONS.items():
-        if full in present:
-            continue
-        cls = FFRemoteAddressInRange if full.endswith("FFRemoteAddressInRange") else FFLocalAddressInRange
-        filt.Functions.Add(cls(IPRangeFilterValue(ip, ip)))  # type: ignore
+    for fn in to_remove:
+        filt.Functions.Remove(fn)  # type: ignore
         changed = True
-        print(f"  + {short}: (缺失，已补全)  ->  {ip} - {ip}")
+        print("  - FFLocalAddressInRange: 已移除（NAT 下公网 IP 不可能是本地地址）")
+
+    if not found_remote:
+        filt.Functions.Add(FFRemoteAddressInRange(IPRangeFilterValue(ip, ip)))  # type: ignore
+        changed = True
+        print(f"  + FFRemoteAddressInRange: (缺失，已补全)  ->  {ip} - {ip}")
 
     return changed
 
 
 def ensure_zone_filter(client, name: str, ip: str):
     """
-    查找过滤器；不存在则创建 Zone 过滤器并填充两种地址范围函数。
+    查找过滤器；不存在则创建 Zone 过滤器（只含远程地址范围函数）。
     返回 (filter, created: bool)
     """
     filt = find_filter_by_name(client, name)
@@ -216,7 +252,6 @@ def ensure_zone_filter(client, name: str, ip: str):
 
     filt = Filter(FilterType.Zone, name)
     filt.Functions.Add(FFRemoteAddressInRange(IPRangeFilterValue(ip, ip)))  # type: ignore
-    filt.Functions.Add(FFLocalAddressInRange(IPRangeFilterValue(ip, ip)))  # type: ignore
     filt = client.AddFilter(filt)  # type: ignore
     print(f"[创建] 区域过滤器 '{name}' 已创建 (Id={filt.Id})")
     return filt, True
