@@ -13,7 +13,7 @@ local-homev4 的 远程地址范围(FFRemoteAddressInRange)，范围语义为单
 （对比 v6：本机通过 SLAAC 直接持有公网前缀，才需要本地范围）。若过滤器中
 残留了本地地址范围函数，脚本会将其移除。
 
-检测：多源并发查询 + 一致性比对（ip.sb / ipify / 3322.net，3 源），
+检测：多源并发查询 + 一致性比对（3 主源 ip.sb/ipify/3322.net + 2 备用源 ipip.net/pconline），
 所有源统一走 IPv4 直连（强制 A 记录解析 + 绕过环境代理），
 任一源超时/失败不阻塞，多源结果不一致时明确报错。
 
@@ -23,7 +23,7 @@ local-homev4 的 远程地址范围(FFRemoteAddressInRange)，范围语义为单
     python py/update_local_homev4.py --force      # IP 未变化时也强制更新
     python py/update_local_homev4.py --name myv4  # 指定过滤器名称
 
-依赖：标准库 socket / ssl / http.client / concurrent.futures；pythonnet（写入 NetLimiter）。
+依赖：标准库 socket / ssl / concurrent.futures；pythonnet（写入 NetLimiter）。
 """
 
 import argparse
@@ -44,9 +44,13 @@ ZONE_FILTER_NAME = "local-homev4"
 #    拿不到家庭宽带真实 IP。
 # 2) 客户端有 IPv6 时双栈源优先返回 IPv6，对 IPv4 检测无效——所以 DNS 只解析 A 记录。
 IP_SOURCES = {
+    # 主源
     "ip.sb": "https://api-ipv4.ip.sb/ip",
     "ipify": "https://api.ipify.org/",
     "3322.net": "https://ip.3322.net/",
+    # 备用源（国内，国外源 ipify 在部分网络直连不通时兜底）
+    "ipip.net": "https://myip.ipip.net/",
+    "pconline": "https://whois.pconline.com.cn/ipJson.jsp",
 }
 DEFAULT_TIMEOUT = 8
 
