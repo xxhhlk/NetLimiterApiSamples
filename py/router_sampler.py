@@ -108,7 +108,7 @@ class RouterSpeedSampler:
     THRESHOLD_KB = 800
     CONSECUTIVE_SECONDS = 3
     INTERNET_FILTER_ID = 2  # Internet 区域 InternalId
-    LAN_FILTER_NAME = "LocalNetwork"  # LAN 区域过滤器名称（自动发现用）
+    LAN_FILTER_NAME = "true local"  # 本地流量过滤器名称（自动发现用，扣减网卡上行中的本地流量）
     HISTORY_SECONDS = 10    # 历史窗口大小（样本数，Internet/LAN/网卡共用）
     LAN_PHY_COEFF = 1.03     # LAN 物理层估算系数（LAN应用层 × 此系数 ≈ LAN物理层，扣除局域网协议开销）
     NIC_LINK_COEFF = 1    # 网卡链路层→IP层折算系数（本机网卡统计链路层含封装开销约9%，路由器ppp0统计IP层）
@@ -272,7 +272,7 @@ class RouterSpeedSampler:
             self.nl_node_loader = self.nl_client.CreateNodeLoader()  # type: ignore
             self.nl_node_loader.Filters.SelectAll()  # type: ignore
 
-            # 自动发现 LAN 区域 FilterId（按名称 LocalNetwork）
+            # 自动发现本地流量过滤 FilterId（按名称）
             self.lan_filter_id = None
             try:
                 for f in self.nl_client.Filters:  # type: ignore
@@ -283,12 +283,12 @@ class RouterSpeedSampler:
                     except Exception:
                         continue
             except Exception as e:
-                self.logger.warn(f"遍历 Filters 发现 LAN 区域失败: {e}", event="NL_LAN_DISCOVER_FAIL")
+                self.logger.warn(f"遍历 Filters 发现本地流量过滤失败: {e}", event="NL_LAN_DISCOVER_FAIL")
 
             if self.lan_filter_id is not None:
-                self.logger.info(f"LAN 区域过滤器已发现: Name={self.LAN_FILTER_NAME}, FilterId={self.lan_filter_id}", event="NL_LAN_FOUND")
+                self.logger.info(f"本地流量过滤器已发现: Name={self.LAN_FILTER_NAME}, FilterId={self.lan_filter_id}", event="NL_LAN_FOUND")
             else:
-                self.logger.warn(f"未发现 LAN 区域过滤器(Name={self.LAN_FILTER_NAME})，LocalSpeedKB 将退回 Internet 应用层速度", event="NL_LAN_NOT_FOUND")
+                self.logger.warn(f"未发现本地流量过滤器(Name={self.LAN_FILTER_NAME})，LocalSpeedKB 将退回 Internet 应用层速度", event="NL_LAN_NOT_FOUND")
 
             # 不在此处初始化基线，让第一次采样时设基线（避免 dt 异常小导致首样本失真）
             self.previous_internet_out = None
@@ -298,7 +298,7 @@ class RouterSpeedSampler:
             self.previous_nic_sent = None
             self.previous_nic_ts = None
 
-            self.logger.info(f"NetLimiter 已连接，Internet FilterId={self.INTERNET_FILTER_ID}, LAN FilterId={self.lan_filter_id}", event="NL_INIT_OK")
+            self.logger.info(f"NetLimiter 已连接，Internet FilterId={self.INTERNET_FILTER_ID}, 本地过滤 FilterId={self.lan_filter_id}", event="NL_INIT_OK")
             return True
 
         except Exception as e:
@@ -395,11 +395,11 @@ class RouterSpeedSampler:
             return None
 
     def _sample_lan_speed(self) -> Optional[float]:
-        """采集 LAN 区域最近10秒平均速度（KB/s）。
+        """采集本地流量过滤（扣除用）最近10秒平均速度（KB/s）。
 
         复用 _sample_internet_speed 已 Load 的 node_loader（同一轮调用，时间对齐）。
         平均方式与 _sample_internet_speed 一致：除以实际 dt 得 KB/s，append 速度值，返回 sum/len。
-        若 LAN 过滤器未发现，返回 None（降级）。
+        若本地流量过滤器未发现，返回 None（降级）。
         """
         if self.lan_filter_id is None:
             return None
@@ -415,7 +415,7 @@ class RouterSpeedSampler:
                     break
 
             if not filter_node:
-                self.logger.warn("未找到 LAN 区域过滤器节点", event="NL_LAN_NODE_NOT_FOUND")
+                self.logger.warn("未找到本地流量过滤节点", event="NL_LAN_NODE_NOT_FOUND")
                 return None
 
             current_out = filter_node.Transferred.Out
@@ -432,7 +432,7 @@ class RouterSpeedSampler:
                 if delta >= 0 and speed_kb < 1048576:
                     self.lan_history.append(speed_kb)
                 else:
-                    self.logger.warn(f"LAN 区域采样异常: 速度={speed_kb}KB/s (已忽略)", event="NL_LAN_SAMPLE_ANOMALY")
+                    self.logger.warn(f"本地流量过滤采样异常: 速度={speed_kb}KB/s (已忽略)", event="NL_LAN_SAMPLE_ANOMALY")
 
             self.previous_lan_out = current_out
             self.previous_lan_ts = current_ts
@@ -446,7 +446,7 @@ class RouterSpeedSampler:
             return result
 
         except Exception as e:
-            self.logger.warn(f"LAN 区域采样失败: {e}", event="NL_LAN_SAMPLE_ERROR", reason=str(e))
+            self.logger.warn(f"本地流量过滤采样失败: {e}", event="NL_LAN_SAMPLE_ERROR", reason=str(e))
             return None
 
     def _sample_nic_speed(self) -> Optional[float]:
@@ -670,7 +670,7 @@ class RouterSpeedSampler:
             local_speed_kb: 修正后本机互联网上行（网卡−LAN，含协议开销），供 rule_checker 使用
             local_app_speed_kb: 原 Internet 应用层速度（参考）
             nic_speed_kb: 网卡物理上行速度（参考）
-            lan_speed_kb: LAN 应用层速度（参考）
+            lan_speed_kb: 本地流量过滤速度（参考）
         """
         try:
             data = {
@@ -770,7 +770,7 @@ class RouterSpeedSampler:
                     # Internet 区域应用层速度（原 LocalSpeedKB，现作为参考 LocalAppSpeedKB）
                     local_app_speed = self._sample_internet_speed()
                     self._touch_main_progress()
-                    # LAN 区域应用层速度（需扣除的局域网流量）
+                    # 本地流量过滤应用层速度（需扣除的本地流量）
                     lan_speed = self._sample_lan_speed()
                     self._touch_main_progress()
 
@@ -778,7 +778,7 @@ class RouterSpeedSampler:
                     # 修正值 = max(0, 网卡物理上行 − LAN应用层)
                     # 若网卡或 LAN 采样失败，降级用 Internet 应用层速度
                     if nic_speed is not None and lan_speed is not None:
-                        # 改进方案：减去 LAN 物理层估算（LAN应用层 × 系数），扣除局域网协议开销
+                        # 改进方案：减去本地流量物理层估算（应用层 × 系数），扣除协议开销
                         lan_phy_est = lan_speed * self.LAN_PHY_COEFF
                         # 再乘链路层→IP层折算系数，扣除以太网/PPPoE封装开销约9%
                         local_speed = round(max(0.0, nic_speed - lan_phy_est) * self.NIC_LINK_COEFF, 2)
