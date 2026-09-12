@@ -4,7 +4,8 @@
 
 使用独立心跳线程解决 SSH 阻塞导致心跳无法更新的问题。
 通过 paramiko 库进行 SSH 连接，比调用 ssh.exe 更可靠。
-新增采集 NetLimiter Internet 区域（InternalId=2）速度，与路由器端对比，区域完全独立。
+新增采集 NetLimiter Internet 速度，与路由器端对比，区域完全独立。
+Internet 过滤器按名称 "true internet" 自动发现，未发现则退回 Internet 区域（InternalId=2）。
 
 方法1补偿协议开销：
 - 网卡物理上行速度（psutil）− NetLimiter LAN 区域应用层速度 = 真实互联网上行（含协议开销）
@@ -107,7 +108,8 @@ class RouterSpeedSampler:
     SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
     THRESHOLD_KB = 800
     CONSECUTIVE_SECONDS = 3
-    INTERNET_FILTER_ID = 2  # Internet 区域 InternalId
+    INTERNET_FILTER_NAME = "true internet"  # 真实外网流量过滤器名称（自动发现用，替换原 Internet 区域）
+    INTERNET_FILTER_FALLBACK_ID = 2  # 未发现 true internet 时退回的 Internet 区域 InternalId
     LAN_FILTER_NAME = "true local"  # 本地流量过滤器名称（自动发现用，扣减网卡上行中的本地流量）
     HISTORY_SECONDS = 10    # 历史窗口大小（样本数，Internet/LAN/网卡共用）
     LAN_PHY_COEFF = 1.03     # LAN 物理层估算系数（LAN应用层 × 此系数 ≈ LAN物理层，扣除局域网协议开销）
@@ -149,6 +151,8 @@ class RouterSpeedSampler:
         self.internet_history = deque(maxlen=self.HISTORY_SECONDS)
         self.previous_internet_out: Optional[int] = None
         self.previous_nl_sample_ts: Optional[float] = None
+        # Internet 区域采样（true internet 过滤器，未发现则退回 Internet 区域）
+        self.internet_filter_id: Optional[int] = None
         # LAN 区域采样（方法1：扣除局域网流量）
         self.lan_filter_id: Optional[int] = None
         self.lan_history = deque(maxlen=self.HISTORY_SECONDS)
@@ -272,6 +276,25 @@ class RouterSpeedSampler:
             self.nl_node_loader = self.nl_client.CreateNodeLoader()  # type: ignore
             self.nl_node_loader.Filters.SelectAll()  # type: ignore
 
+            # 自动发现 Internet 过滤 FilterId（按名称 true internet，未发现则退回 Internet 区域）
+            self.internet_filter_id = None
+            try:
+                for f in self.nl_client.Filters:  # type: ignore
+                    try:
+                        if f.Name and f.Name.lower() == self.INTERNET_FILTER_NAME.lower():
+                            self.internet_filter_id = f.InternalId
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.logger.warn(f"遍历 Filters 发现 Internet 过滤失败: {e}", event="NL_INTERNET_DISCOVER_FAIL")
+
+            if self.internet_filter_id is not None:
+                self.logger.info(f"Internet 过滤器已发现: Name={self.INTERNET_FILTER_NAME}, FilterId={self.internet_filter_id}", event="NL_INTERNET_FOUND")
+            else:
+                self.internet_filter_id = self.INTERNET_FILTER_FALLBACK_ID
+                self.logger.warn(f"未发现 Internet 过滤器(Name={self.INTERNET_FILTER_NAME})，退回 Internet 区域 FilterId={self.internet_filter_id}", event="NL_INTERNET_NOT_FOUND")
+
             # 自动发现本地流量过滤 FilterId（按名称）
             self.lan_filter_id = None
             try:
@@ -298,7 +321,7 @@ class RouterSpeedSampler:
             self.previous_nic_sent = None
             self.previous_nic_ts = None
 
-            self.logger.info(f"NetLimiter 已连接，Internet FilterId={self.INTERNET_FILTER_ID}, 本地过滤 FilterId={self.lan_filter_id}", event="NL_INIT_OK")
+            self.logger.info(f"NetLimiter 已连接，Internet FilterId={self.internet_filter_id}, 本地过滤 FilterId={self.lan_filter_id}", event="NL_INIT_OK")
             return True
 
         except Exception as e:
@@ -316,7 +339,7 @@ class RouterSpeedSampler:
             self.nl_node_loader.Load()  # type: ignore
             filter_node = None
             for node in self.nl_node_loader.Filters.Nodes:  # type: ignore
-                if node.FilterId == self.INTERNET_FILTER_ID:
+                if node.FilterId == self.internet_filter_id:
                     filter_node = node
                     break
             

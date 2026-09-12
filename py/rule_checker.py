@@ -49,7 +49,9 @@ class RuleChecker:
     """规则检查器"""
     
     # qBittorrent 限速规则配置
-    LIMIT_RULE_ID = "f4c3e3ac-91d1-435b-af27-f9020b4eab4e"
+    # 规则归属过滤器: zzz_qbit_pub_internet (InternalId=69)
+    # 2026-09-12 从组合过滤 2ad0b10c-379a-4a0e-ad5b-2dd863d8b312(InternalId=40) 搬运而来
+    LIMIT_RULE_ID = "7c9220f2-74b4-4e22-aa1f-119271543f2a"
     THRESHOLD_KB = 600
     CHECK_INTERVAL_SECONDS = 20
     FIRST_CHECK_DELAY_SECONDS = 5
