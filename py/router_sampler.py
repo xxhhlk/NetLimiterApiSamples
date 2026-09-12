@@ -593,14 +593,19 @@ class RouterSpeedSampler:
             self._cleanup_ssh()
             return False
     
-    def _read_router_speed(self) -> Optional[float]:
+    def _read_router_speed(self) -> Optional[tuple]:
         """
         读取路由器速度（阻塞带超时）
 
-        使用 channel 的超时设置（1秒），有数据立即返回，无数据阻塞等待。
+        speed_num_only.sh 每秒输出一行三列（KB/s）：
+            wan  tunnel  wg0
+        - wan: ppp0 出方向总速度（含 BT 隧道封装开销）
+        - tunnel: ppp0 上 BT 隧道 QUIC 流速度（含封装）
+        - wg0: 隧道内层净载荷速度
+        兼容旧版单列输出（此时 tunnel/wg0 按 0 处理）。
 
         Returns:
-            速度值（KB/s），无数据或超时返回 None
+            (wan_speed, tunnel_speed, wg0_speed) 元组，无数据或超时返回 None
         """
         if not self.ssh_channel:
             return None
@@ -639,12 +644,19 @@ class RouterSpeedSampler:
 
             for line in reversed(lines):  # 取最后一行
                 line = line.strip()
-                if line:
-                    try:
-                        speed_kb = float(line)
-                        return speed_kb
-                    except ValueError:
-                        continue
+                if not line:
+                    continue
+                parts = line.split()
+                try:
+                    values = [float(p) for p in parts]
+                except ValueError:
+                    continue
+                if len(values) >= 3:
+                    return values[0], values[1], values[2]
+                if len(values) == 1:
+                    # 旧版单列输出：只有 WAN 总速，无隧道分离
+                    return values[0], 0.0, 0.0
+                continue
 
             return None
 
@@ -684,20 +696,26 @@ class RouterSpeedSampler:
         nic_speed_kb: Optional[float],
         lan_speed_kb: Optional[float],
         over_threshold_seconds: int,
-        below_threshold_seconds: int
+        below_threshold_seconds: int,
+        router_raw_speed_kb: Optional[float] = None,
+        tunnel_overhead_kb: Optional[float] = None
     ):
         """保存路由器数据
 
         Args:
-            router_speed_kb: 路由器实测上传速度
+            router_speed_kb: 对齐后路由器速度（ppp0 − 隧道封装开销），供 rule_checker 使用
             local_speed_kb: 修正后本机互联网上行（网卡−LAN，含协议开销），供 rule_checker 使用
             local_app_speed_kb: 原 Internet 应用层速度（参考）
             nic_speed_kb: 网卡物理上行速度（参考）
             lan_speed_kb: 本地流量过滤速度（参考）
+            router_raw_speed_kb: ppp0 原始总速（对齐前，参考）
+            tunnel_overhead_kb: BT 隧道封装开销（QUIC流 − wg0内层，参考）
         """
         try:
             data = {
                 "RouterSpeedKB": router_speed_kb,
+                "RouterRawSpeedKB": router_raw_speed_kb,
+                "TunnelOverheadKB": tunnel_overhead_kb,
                 "LocalSpeedKB": local_speed_kb,
                 "LocalAppSpeedKB": local_app_speed_kb,
                 "NicSpeedKB": nic_speed_kb,
@@ -786,6 +804,13 @@ class RouterSpeedSampler:
                 if router_speed is not None:
                     self.sample_count += 1
 
+                    # 三列解析：wan(含封装) / tunnel(QUIC流,含封装) / wg0(内层净载荷)
+                    wan_speed, tunnel_speed, wg0_speed = router_speed
+                    # 隧道封装开销 = QUIC流字节 - 内层净载荷字节（WG+QUIC+PPPoE 头），
+                    # 从 WAN 总量中剔除，避免 qb 隧道开销被误判为其他设备占用
+                    tunnel_overhead = max(0.0, tunnel_speed - wg0_speed)
+                    router_aligned = round(wan_speed - tunnel_overhead, 2)
+
                     # 方法1：依次连续采样网卡→Internet→LAN，保证时间对齐
                     # 网卡物理上行（含协议开销）
                     nic_speed = self._sample_nic_speed()
@@ -808,11 +833,11 @@ class RouterSpeedSampler:
                     else:
                         local_speed = local_app_speed
 
-                    # 使用当前路由器速度进行实时比较（不延迟）
-                    comparison = self._compare_speeds(router_speed, local_speed)
+                    # 使用对齐后路由器速度进行实时比较（不延迟）
+                    comparison = self._compare_speeds(router_aligned, local_speed)
 
                     # 保存当前路由器速度
-                    self.prev_router_speed_kb = router_speed
+                    self.prev_router_speed_kb = router_aligned
 
                     # 检查阈值：差值 > THRESHOLD_KB
                     speed_diff = comparison.get("Diff")
@@ -825,13 +850,15 @@ class RouterSpeedSampler:
 
                     # 保存数据
                     self._save_router_data(
-                        router_speed,
+                        router_aligned,
                         comparison.get("LocalSpeed"),
                         local_app_speed,
                         nic_speed,
                         lan_speed,
                         self.over_threshold_count,
-                        self.below_threshold_count
+                        self.below_threshold_count,
+                        router_raw_speed_kb=wan_speed,
+                        tunnel_overhead_kb=tunnel_overhead
                     )
 
                     # 日志输出
@@ -840,6 +867,8 @@ class RouterSpeedSampler:
                     nic_speed_str = f"{nic_speed:.1f}" if nic_speed is not None else "N/A"
                     lan_speed_str = f"{lan_speed:.1f}" if lan_speed is not None else "N/A"
                     diff_str = f"{speed_diff:.1f}" if speed_diff is not None else "N/A"
+                    wan_str = f"{wan_speed:.1f}"
+                    overhead_str = f"{tunnel_overhead:.1f}"
                     # 使用comparison中的RouterSpeed（上一秒的值）来保持一致性
                     displayed_router_speed = comparison.get("RouterSpeed")
                     router_speed_str = f"{displayed_router_speed:.1f}" if displayed_router_speed is not None else "N/A"
@@ -851,7 +880,7 @@ class RouterSpeedSampler:
                         interval_str = f", 间隔={interval:.1f}s"
 
                     self.logger.info(
-                        f"路由器: {router_speed_str} KB/s, "
+                        f"路由器: {router_speed_str} KB/s (原始 {wan_str}, 隧道开销 {overhead_str}), "
                         f"本机(修正): {local_speed_str} KB/s, "
                         f"应用层: {app_speed_str} KB/s, "
                         f"网卡: {nic_speed_str} KB/s, "
@@ -869,7 +898,7 @@ class RouterSpeedSampler:
                         self.logger.alert(
                             "THRESHOLD_EXCEEDED",
                             f"速度差超过阈值 {self.THRESHOLD_KB} KB/s 已达 {self.over_threshold_count} 秒",
-                            {"router_speed": router_speed, "local_speed": local_speed, "diff": speed_diff, "threshold": self.THRESHOLD_KB}
+                            {"router_speed": router_aligned, "router_raw": wan_speed, "tunnel_overhead": tunnel_overhead, "local_speed": local_speed, "diff": speed_diff, "threshold": self.THRESHOLD_KB}
                         )
                 
                 # 检查 SSH 连接状态
