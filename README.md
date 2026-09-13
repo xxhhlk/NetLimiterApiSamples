@@ -180,6 +180,18 @@ python main.py
 - 日志与心跳文件位于 `%TEMP%/nl_watchdog/`
 - 按 `Ctrl+C` 优雅关闭所有模块
 
+#### 存活判定（三道闸，全部 fail-closed）
+
+| 信号 | 判定 | 阈值 |
+|------|------|------|
+| 进程存活 | `Process.is_alive()` | 退出即重启 |
+| 心跳文件 | `%TEMP%/nl_watchdog/<module>.heartbeat.json` 的 `last_ok` | 10s 未更新视为卡住；**文件缺失/损坏也视为卡住** |
+| 数据文件 | `%TEMP%/qb_speed_data.json`、`router_speed_data.json` 的 mtime | 60s 未更新视为卡住（抓"心跳线程活、主循环假死"） |
+
+- 模块启动后 30s 宽限期内不做判定；连续 2 次判定异常才重启（避免单次抖动误杀）
+- 心跳写入失败不再静默：`heartbeat.py` 每次写入前重建目录，失败计数写入 `write_errors` 字段，Supervisor 读到即告警
+- 历史失效模式：`router_sampler` 曾整体假死 22 小时（主线程卡在原生调用、心跳线程随 GIL 一起停），旧实现"心跳文件不存在 → 认为正常"导致 Supervisor 完全无感
+
 单独调试某个模块：
 
 ```bash

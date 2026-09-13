@@ -69,9 +69,18 @@ class RuleChecker:
     COOLDOWN_MULTIPLIER = 3
     COOLDOWN_SECONDS = 60
 
+    # 数据新鲜度上限
+    QBIT_DATA_MAX_AGE_SECONDS = 5      # qb_speed_data.json（speed_sampler 每 5s 写一次）
+    ROUTER_DATA_MAX_AGE_SECONDS = 15   # router_speed_data.json（router_sampler 主循环约 1s 写一次）
+
     # 采样源健康检查：qb 数据长期恒 0 时告警（不参与判定，仅暴露"采样读错过滤器"类静默失效）
     ZERO_ALERT_AFTER_SECONDS = 600    # 连续 10 分钟 AvgSpeedKB == 0 开始告警
     ZERO_ALERT_REPEAT_SECONDS = 3600  # 之后每 60 分钟重复一次
+
+    # 路由器数据中断告警：数据陈旧即跳过判定（不再静默使用陈旧值），中断过久升级为 error
+    ROUTER_STALE_ALERT_AFTER_SECONDS = 60     # 连续陈旧超过 60s 升级为 error 告警
+    ROUTER_STALE_ALERT_REPEAT_SECONDS = 600   # 之后每 10 分钟重复一次
+    STALE_LOG_FIRST_N = 3                     # 前 N 次陈旧只记 warn，避免刷屏
 
     # 连接错误自动恢复配置
     MAX_CONSECUTIVE_ERRORS = 10  # 连续错误最大次数，超过则退出
@@ -104,6 +113,11 @@ class RuleChecker:
         # 采样源零值看护状态
         self._zero_since: Optional[float] = None
         self._last_zero_alert: float = 0.0
+
+        # 路由器数据陈旧看护状态
+        self._router_stale_since: Optional[float] = None
+        self._router_stale_count = 0
+        self._last_router_stale_alert: float = 0.0
 
         # NetLimiter 客户端
         self.client: Optional[NLClient] = None
@@ -383,17 +397,30 @@ class RuleChecker:
             self.logger.error(f"读取路由器数据失败: {e}", event="ROUTER_DATA_READ_ERROR")
             return None
     
-    def _is_data_fresh(self, data: Optional[Dict[str, Any]]) -> bool:
-        """检查数据是否新鲜"""
+    def _data_age_seconds(self, data: Optional[Dict[str, Any]]) -> Optional[float]:
+        """返回数据年龄（秒），无法解析时返回 None"""
         if not data or not data.get("LastUpdate"):
-            return False
-        
+            return None
+
         try:
             last_update = datetime.fromisoformat(data["LastUpdate"])
-            age = (datetime.now() - last_update).total_seconds()
-            return age < 5
+            return (datetime.now() - last_update).total_seconds()
         except Exception:
-            return False
+            return None
+
+    def _is_data_fresh(self, data: Optional[Dict[str, Any]]) -> bool:
+        """检查 qb 数据是否新鲜"""
+        age = self._data_age_seconds(data)
+        return age is not None and age < self.QBIT_DATA_MAX_AGE_SECONDS
+
+    def _is_router_data_fresh(self, data: Optional[Dict[str, Any]]) -> bool:
+        """检查路由器数据是否新鲜
+
+        与 qb 路径对齐：陈旧数据不得参与判定。router_sampler 假死时
+        OverThresholdSeconds/BelowThresholdSeconds 会被冻结，规则状态随之卡死。
+        """
+        age = self._data_age_seconds(data)
+        return age is not None and age < self.ROUTER_DATA_MAX_AGE_SECONDS
     
     def _is_client_connected(self) -> bool:
         """检查NetLimiter客户端是否已连接，兼容不同版本枚举表示"""
@@ -539,6 +566,47 @@ class RuleChecker:
         except Exception as e:
             self.logger.error(f"零值看护异常: {e}", event="QBIT_ZERO_WATCH_ERROR")
 
+    def _on_router_data_stale(self, age: Optional[float], read_failed: bool = False) -> None:
+        """路由器数据陈旧/不可读时的看护：跳过判定并逐级告警
+
+        Args:
+            age: 数据年龄（秒），None 表示无法解析
+            read_failed: 数据文件缺失/读取失败
+        """
+        now = time.time()
+        if self._router_stale_since is None:
+            self._router_stale_since = now
+        self._router_stale_count += 1
+        stale_for = now - self._router_stale_since
+
+        if read_failed:
+            detail = "数据文件缺失或不可读"
+        elif age is None:
+            detail = "LastUpdate 无法解析"
+        else:
+            detail = f"数据年龄={age:.1f}s > 上限={self.ROUTER_DATA_MAX_AGE_SECONDS}s"
+
+        if self._router_stale_count <= self.STALE_LOG_FIRST_N:
+            self.logger.warn(
+                f"路由器数据已失效（{detail}），跳过本轮路由器规则检查 "
+                f"(连续 {self._router_stale_count} 次)",
+                event="ROUTER_DATA_EXPIRED"
+            )
+            return
+
+        if stale_for < self.ROUTER_STALE_ALERT_AFTER_SECONDS:
+            return
+        if now - self._last_router_stale_alert < self.ROUTER_STALE_ALERT_REPEAT_SECONDS:
+            return
+
+        self._last_router_stale_alert = now
+        self.logger.error(
+            f"路由器采样数据已中断 {int(stale_for)} 秒（{detail}），router_sampler 可能已卡死；"
+            f"路由器规则判定停摆，规则状态将冻结在当前值无法自动恢复。"
+            f"请检查 router_sampler 进程存活与 router_speed_sampler 日志",
+            event="ROUTER_DATA_STALE_ALERT"
+        )
+
     def _get_local_avg_speed_kb(self) -> Optional[float]:
         """获取本机最近10秒平均速度"""
         try:
@@ -649,15 +717,9 @@ class RuleChecker:
         
         while wait_count < max_wait and self.running:
             router_data = self._get_router_data()
-            if router_data is not None and router_data.get("LastUpdate"):
-                try:
-                    last_update = datetime.fromisoformat(router_data["LastUpdate"])
-                    age = (datetime.now() - last_update).total_seconds()
-                    if age < 5:
-                        self.logger.info("路由器速度采样器数据已就绪", event="ROUTER_SAMPLER_READY")
-                        return True
-                except Exception:
-                    pass
+            if self._is_router_data_fresh(router_data):
+                self.logger.info("路由器速度采样器数据已就绪", event="ROUTER_SAMPLER_READY")
+                return True
             
             if wait_count % 5 == 0:
                 self.logger.info(f"等待路由器速度采样器数据: {wait_count}s", event="WAIT_ROUTER_DATA")
@@ -743,8 +805,14 @@ class RuleChecker:
                 if current_time - last_router_check >= router_effective_interval:
                     try:
                         router_data = self._get_router_data()
-                        if router_data is not None:
+                        if router_data is None:
+                            self._on_router_data_stale(None, read_failed=True)
+                        elif self._is_router_data_fresh(router_data):
+                            self._router_stale_since = None
+                            self._router_stale_count = 0
                             self._check_router_rule(router_data)
+                        else:
+                            self._on_router_data_stale(self._data_age_seconds(router_data))
                     except Exception as e:
                         self.logger.error(f"路由器检查链路异常: {e}", event="ROUTER_CHECK_ERROR")
                     finally:

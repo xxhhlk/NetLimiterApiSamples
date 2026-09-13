@@ -35,7 +35,11 @@ class HeartbeatManager:
         self._error: Optional[str] = None
         self._loop_count = 0
         self._running = True
-        
+
+        # 写入健康度（写入失败不再静默丢弃，由 supervisor 读心跳内容时暴露）
+        self._write_errors = 0
+        self._last_write_error: Optional[str] = None
+
         # 心跳文件路径 (与 PowerShell 版本兼容)
         heartbeat_dir = Path(os.environ.get('TEMP', '.')) / "nl_watchdog"
         heartbeat_dir.mkdir(parents=True, exist_ok=True)
@@ -62,26 +66,37 @@ class HeartbeatManager:
             time.sleep(self.interval)
     
     def _write_heartbeat(self):
-        """写入心跳文件"""
+        """写入心跳文件
+
+        每次写入前确保目录存在：%TEMP% 可能被系统清理或人工删除，
+        只在 __init__ 里 mkdir 会让后续写入全部失败，安全网静默失效。
+        写入失败不再静默吞掉，而是记数并通过心跳内容暴露给 supervisor。
+        """
         with self._lock:
             data = {
                 "module": self.module_name,
                 "pid": os.getpid(),
                 "last_ok": datetime.now().isoformat(),
                 "loop_count": self._loop_count,
-                "status": self._status
+                "status": self._status,
+                "write_errors": self._write_errors
             }
             if self._error:
                 data["error"] = self._error
+            if self._last_write_error:
+                data["write_error"] = self._last_write_error
 
-            # 原子写入：先写临时文件，再替换（在锁保护下执行）
             try:
+                self.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+                # 原子写入：先写临时文件，再替换（在锁保护下执行）
                 tmp_file = str(self.heartbeat_file) + ".tmp"
                 with open(tmp_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False)
                 os.replace(tmp_file, self.heartbeat_file)
-            except Exception:
-                pass  # 忽略写入错误，避免影响主线程
+                self._last_write_error = None
+            except Exception as e:
+                self._write_errors += 1
+                self._last_write_error = str(e)
     
     def update_status(self, status: str, error: Optional[str] = None):
         """
@@ -106,9 +121,20 @@ class HeartbeatManager:
             return self._status
     
     def stop(self):
-        """停止心跳线程"""
+        """停止心跳线程，并写入最终状态
+
+        写入 STOPPED 让 supervisor 能区分"优雅退出"与"假死"。
+        """
         self._running = False
-    
+        with self._lock:
+            self._status = "STOPPED"
+        self._write_heartbeat()
+
     def is_running(self) -> bool:
         """检查心跳线程是否在运行"""
         return self._running and self._thread.is_alive()
+
+    def get_write_errors(self) -> int:
+        """获取心跳写入累计失败次数"""
+        with self._lock:
+            return self._write_errors

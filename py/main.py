@@ -146,23 +146,34 @@ class ModuleProcess:
 
 class Supervisor:
     """进程监控器"""
-    
+
+    # 健康检查参数
+    HEARTBEAT_TIMEOUT_SECONDS = 10   # 心跳超过该时长未更新视为卡住
+    HEARTBEAT_GRACE_SECONDS = 30     # 模块启动后的宽限期（首个心跳尚未落盘）
+    HEALTH_FAIL_TOLERANCE = 2        # 连续 N 次健康检查失败才重启（避免单次抖动误杀）
+
     # 模块配置
     MODULES = {
         "speed_sampler": {
             "description": "速度采样器",
             "restart_delay": 5,
             "max_restarts": 10,
+            # 二级存活信号：主循环产出的数据文件（心跳线程活但主循环假死时靠它发现）
+            "data_file": "qb_speed_data.json",
+            "data_stale_seconds": 60,
         },
         "router_sampler": {
             "description": "路由器速度采样器",
             "restart_delay": 5,
             "max_restarts": 10,
+            "data_file": "router_speed_data.json",
+            "data_stale_seconds": 60,
         },
         "rule_checker": {
             "description": "规则检查器",
             "restart_delay": 5,
             "max_restarts": 10,
+            "data_file": None,  # 无数据文件产出，仅用心跳
         },
     }
     
@@ -171,6 +182,13 @@ class Supervisor:
         self.modules: Dict[str, ModuleProcess] = {}
         self.running = True
         self.monitor_interval = 12  # 监控间隔（秒）
+
+        # 健康检查连续失败计数（按模块）
+        self._health_failures: Dict[str, int] = {}
+        # 心跳写入失败的已告警次数（避免刷屏）
+        self._hb_write_warned: Dict[str, int] = {}
+        # 数据文件陈旧已告警标记
+        self._data_stale_warned: set = set()
         
         # 设置信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -222,43 +240,115 @@ class Supervisor:
         
         self.logger.info("所有模块已停止", event="STOPPED_ALL")
     
-    def _check_heartbeat(self, module_name: str, timeout_seconds: int = 10) -> bool:
+    @staticmethod
+    def _heartbeat_dir() -> Path:
+        return Path(os.environ.get('TEMP', '.')) / "nl_watchdog"
+
+    @staticmethod
+    def _module_uptime(module: ModuleProcess) -> float:
+        """模块已运行秒数"""
+        if module.start_time is None:
+            return 0.0
+        return (datetime.now() - module.start_time).total_seconds()
+
+    def _check_heartbeat(self, module_name: str, module: ModuleProcess) -> bool:
         """
-        检查模块心跳是否超时
+        检查模块心跳
+
+        失败闭（fail-closed）：心跳文件缺失/过期/损坏一律视为异常。
+        历史教训：router_sampler 曾整体假死 22 小时（主线程卡在原生调用里、心跳线程
+        随 GIL 一起停），而旧实现"文件不存在 → 认为正常"导致 supervisor 完全无感。
 
         Args:
             module_name: 模块名称
-            timeout_seconds: 心跳超时时间（秒）
+            module: 模块进程管理器（用于启动宽限期判断）
 
         Returns:
-            True: 心跳正常
-            False: 心跳超时或文件不存在
+            True: 心跳正常；False: 心跳异常
         """
+        # 启动宽限期内不判失败（进程刚起，首个心跳可能尚未落盘）
+        if self._module_uptime(module) < self.HEARTBEAT_GRACE_SECONDS:
+            return True
+
         try:
-            heartbeat_dir = Path(os.environ.get('TEMP', '.')) / "nl_watchdog"
-            heartbeat_file = heartbeat_dir / f"{module_name}.heartbeat.json"
+            heartbeat_file = self._heartbeat_dir() / f"{module_name}.heartbeat.json"
 
             if not heartbeat_file.exists():
-                # 心跳文件不存在，可能是模块刚启动还没写入
-                return True
+                return False
 
             data = json.loads(heartbeat_file.read_text(encoding='utf-8'))
-            last_ok_str = data.get("last_ok")
 
+            # 主动退出（优雅停止）不算卡死，进程存活与否由 is_alive 判定
+            if data.get("status") == "STOPPED":
+                return True
+
+            # 心跳自身写入失败（如 %TEMP%\nl_watchdog 被清理/权限异常）——安全网异常，必须暴露
+            write_errors = data.get("write_errors", 0) or 0
+            if write_errors > 0 and self._hb_write_warned.get(module_name, 0) < write_errors:
+                self._hb_write_warned[module_name] = write_errors
+                self.logger.warn(
+                    f"模块 {module_name} 心跳写入累计失败 {write_errors} 次，"
+                    f"最近错误: {data.get('write_error', '?')}",
+                    event="HEARTBEAT_WRITE_ERROR"
+                )
+
+            last_ok_str = data.get("last_ok")
             if not last_ok_str:
                 return False
 
             last_ok = datetime.fromisoformat(last_ok_str)
             elapsed = (datetime.now() - last_ok).total_seconds()
 
-            return elapsed < timeout_seconds
+            return elapsed < self.HEARTBEAT_TIMEOUT_SECONDS
 
         except Exception:
-            # 读取失败时保守处理，认为心跳正常
+            # 读取/解析失败一律视为异常（fail-closed）
+            return False
+
+    def _check_data_file(self, module_name: str, module: ModuleProcess) -> bool:
+        """
+        二级存活信号：模块主循环产出的数据文件是否仍在更新
+
+        心跳线程与主循环可能"不同步地"卡住：主循环阻塞在原生/网络调用而 GIL 被释放时，
+        心跳照常更新，但模块已不再产出数据。此时只有数据文件 mtime 能发现问题。
+
+        Returns:
+            True: 数据文件新鲜或该模块无数据文件；False: 停止更新
+        """
+        config = self.MODULES.get(module_name, {})
+        file_name = config.get("data_file")
+        if not file_name:
+            return True
+
+        # 启动宽限期内不做判断
+        if self._module_uptime(module) < self.HEARTBEAT_GRACE_SECONDS:
+            return True
+
+        stale_seconds = config.get("data_stale_seconds", 60)
+        data_file = Path(os.environ.get('TEMP', '.')) / file_name
+
+        try:
+            if not data_file.exists():
+                # 宽限期已过仍无数据文件 = 模块没在干活
+                return False
+
+            age = time.time() - data_file.stat().st_mtime
+            if age > stale_seconds:
+                if module_name not in self._data_stale_warned:
+                    self._data_stale_warned.add(module_name)
+                    self.logger.warn(
+                        f"模块 {module_name} 数据文件 {file_name} 已 {age:.0f}s 未更新 "
+                        f"(上限 {stale_seconds}s)，疑似主循环卡住",
+                        event="MODULE_DATA_STALE"
+                    )
+                return False
+            return True
+        except Exception:
+            # 无法读取时保守放行，避免误杀
             return True
 
     def monitor(self):
-        """监控循环 - 同时检查进程状态和心跳状态"""
+        """监控循环 - 同时检查进程状态、心跳状态与数据文件新鲜度"""
         self.logger.info(f"开始监控，间隔 {self.monitor_interval} 秒", event="MONITOR_START")
 
         # 给模块一些启动时间，首次不检查心跳
@@ -269,43 +359,66 @@ class Supervisor:
             try:
                 for name, module in self.modules.items():
                     process_alive = module.is_alive()
-                    heartbeat_ok = True
+                    reason = ""
 
-                    # 进程存在时才检查心跳
-                    if process_alive and (time.time() - start_time) > heartbeat_check_delay:
-                        heartbeat_ok = self._check_heartbeat(name)
+                    if not process_alive:
+                        reason = "进程已退出"
+                    elif (time.time() - start_time) > heartbeat_check_delay:
+                        failures = []
+                        if not self._check_heartbeat(name, module):
+                            failures.append("心跳超时(可能卡住)")
+                        if not self._check_data_file(name, module):
+                            failures.append("数据文件停止更新(主循环卡住)")
 
-                    # 进程退出或心跳超时都需要重启
-                    if not process_alive or not heartbeat_ok:
-                        config = self.MODULES.get(name, {})
-                        max_restarts = config.get("max_restarts", 10)
-                        restart_delay = config.get("restart_delay", 5)
+                        if not failures:
+                            # 全部正常，清零连续失败计数
+                            self._health_failures[name] = 0
+                            continue
 
-                        if not process_alive:
-                            reason = "进程已退出"
-                        else:
-                            reason = "心跳超时（可能卡住）"
+                        count = self._health_failures.get(name, 0) + 1
+                        self._health_failures[name] = count
+                        reason = " + ".join(failures)
 
-                        if module.restart_count < max_restarts:
+                        if count < self.HEALTH_FAIL_TOLERANCE:
+                            # 先容忍一次，下一轮仍异常才重启（避免单次抖动误杀）
                             self.logger.warn(
-                                f"模块 {name} {reason}，{restart_delay} 秒后重启 "
-                                f"(重启次数: {module.restart_count + 1}/{max_restarts})",
-                                event="MODULE_RESTART",
-                                reason=reason
+                                f"模块 {name} 健康检查异常: {reason} "
+                                f"(连续 {count}/{self.HEALTH_FAIL_TOLERANCE})",
+                                event="MODULE_UNHEALTHY"
                             )
-                            time.sleep(restart_delay)
-                            module.restart()
-                        else:
-                            self.logger.error(
-                                f"模块 {name} 重启次数已达上限 {max_restarts}，不再重启",
-                                event="MODULE_MAX_RESTARTS"
-                            )
+                            continue
+                    else:
+                        continue
+
+                    # 走到这里说明需要重启
+                    config = self.MODULES.get(name, {})
+                    max_restarts = config.get("max_restarts", 10)
+                    restart_delay = config.get("restart_delay", 5)
+
+                    if module.restart_count < max_restarts:
+                        self.logger.warn(
+                            f"模块 {name} {reason}，{restart_delay} 秒后重启 "
+                            f"(重启次数: {module.restart_count + 1}/{max_restarts})",
+                            event="MODULE_RESTART",
+                            reason=reason
+                        )
+                        time.sleep(restart_delay)
+                        module.restart()
+                        # 重启后重置健康状态跟踪
+                        self._health_failures[name] = 0
+                        self._data_stale_warned.discard(name)
+                    else:
+                        self.logger.error(
+                            f"模块 {name} 重启次数已达上限 {max_restarts}，不再重启",
+                            event="MODULE_MAX_RESTARTS"
+                        )
 
                 time.sleep(self.monitor_interval)
 
             except Exception as e:
                 self.logger.error(f"监控异常: {e}", event="MONITOR_ERROR")
                 time.sleep(1)
+
     
     def run(self):
         """主运行方法"""
