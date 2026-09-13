@@ -41,6 +41,7 @@ except Exception as e:
 # 添加当前目录到路径，以便导入 common 模块
 sys.path.insert(0, str(Path(__file__).parent))
 
+from common import ENV_ROUTER_RULE_ENABLED, env_flag
 from common.heartbeat import HeartbeatManager
 from common.logger import Logger
 
@@ -91,9 +92,15 @@ class RuleChecker:
     ROUTER_DATA_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.json"
     ROUTER_LOCK_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.lock"
     
-    def __init__(self):
+    def __init__(self, router_rule_enabled: Optional[bool] = None):
         self.logger = Logger("rule_checker")
         self.heartbeat = HeartbeatManager("rule_checker")
+
+        # 路由器规则总开关：关闭后不读 router 采样数据、不做任何规则写入，
+        # 规则状态保持现状（需要停用限速请手动在 NetLimiter 里关）
+        self.router_rule_enabled = (
+            env_flag(ENV_ROUTER_RULE_ENABLED, True) if router_rule_enabled is None else router_rule_enabled
+        )
 
         # 确保数据文件目录存在
         self.DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -688,6 +695,18 @@ class RuleChecker:
             self.logger.error(f"路由器规则检查错误: {e}", event="ROUTER_RULE_CHECK_ERROR", reason=error_msg)
             self._handle_api_error(error_msg, "路由器规则检查")
     
+    def _describe_router_rule_state(self) -> str:
+        """读取路由器规则当前状态，仅用于开关关闭时的显式提示（不写入）"""
+        try:
+            if not self._is_client_connected() and not self._connect_nl_client():
+                return "未知(未连接)"
+            rule = self._get_cached_rule(self.ROUTER_RULE_ID)
+            if rule is None:
+                return "未找到规则"
+            return "已启用(仍在限速，需手动关闭)" if rule.IsEnabled else "已禁用"
+        except Exception as e:
+            return f"未知({e})"
+
     def _wait_for_speed_sampler(self) -> bool:
         """等待速度采样器数据就绪"""
         self.logger.info("等待速度采样器数据...")
@@ -748,9 +767,16 @@ class RuleChecker:
             self.logger.error("速度采样器数据不可用，退出", event="SPEED_SAMPLER_UNAVAILABLE")
             sys.exit(1)
         
-        # 等待路由器速度采样器数据就绪
-        if not self._wait_for_router_sampler():
-            self.logger.warn("路由器速度采样器数据不可用，继续运行", event="ROUTER_SAMPLER_UNAVAILABLE")
+        # 等待路由器速度采样器数据就绪（路由器规则关闭时跳过）
+        if self.router_rule_enabled:
+            if not self._wait_for_router_sampler():
+                self.logger.warn("路由器速度采样器数据不可用，继续运行", event="ROUTER_SAMPLER_UNAVAILABLE")
+        else:
+            self.logger.warn(
+                f"路由器规则链已关闭 (--no-router / {ENV_ROUTER_RULE_ENABLED}=0)："
+                f"不再读取 router 采样数据、不做规则变更；当前规则状态={self._describe_router_rule_state()}",
+                event="ROUTER_RULE_DISABLED_BY_CONFIG"
+            )
         
         # 首次检查延迟
         time.sleep(self.FIRST_CHECK_DELAY_SECONDS)
@@ -802,7 +828,7 @@ class RuleChecker:
                         last_qbit_check = current_time
                 
                 # 路由器规则检查（动态间隔，默认2秒，触发后60秒内6秒）
-                if current_time - last_router_check >= router_effective_interval:
+                if self.router_rule_enabled and current_time - last_router_check >= router_effective_interval:
                     try:
                         router_data = self._get_router_data()
                         if router_data is None:
@@ -839,9 +865,19 @@ class RuleChecker:
 def main():
     parser = argparse.ArgumentParser(description="规则检查器")
     parser.add_argument("--service", action="store_true", help="服务模式运行")
+    parser.add_argument("--no-router", action="store_true",
+                        help=f"不检查/不变更路由器规则（等价于 {ENV_ROUTER_RULE_ENABLED}=0）")
+    parser.add_argument("--router", action="store_true",
+                        help="强制启用路由器规则检查（覆盖环境变量）")
     args = parser.parse_args()
-    
-    checker = RuleChecker()
+
+    router_enabled = None
+    if args.no_router:
+        router_enabled = False
+    elif args.router:
+        router_enabled = True
+
+    checker = RuleChecker(router_rule_enabled=router_enabled)
     checker.run()
 
 

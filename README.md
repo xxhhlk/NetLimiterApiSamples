@@ -200,6 +200,34 @@ python rule_checker.py      # 仅运行规则检查
 python demo_method1.py      # 观察本机互联网上行修正效果
 ```
 
+#### 开关：临时关闭路由器规则链
+
+一个布尔开关控制整条 router 链：关闭后**不启动 `router_sampler`**，`rule_checker` 也不读取 router 采样数据、不做路由器规则判定。
+
+| 方式 | 用法 | 优先级 |
+|------|------|--------|
+| 命令行 | `python main.py --no-router`（关闭）/ `--router`（强制开启） | 最高 |
+| 环境变量 | `set NL_ROUTER_RULE_ENABLED=0`（`1/true/yes/on` 视为开启，无法识别的值按默认开启） | 次之 |
+| 默认 | 不设置即开启，行为与改动前完全一致 | — |
+
+```bash
+# 临时关闭（当前会话）
+set NL_ROUTER_RULE_ENABLED=0
+python main.py
+
+# 或直接命令行
+python main.py --no-router
+
+# 单独调试 rule_checker 时同样有效
+python rule_checker.py --no-router
+```
+
+关闭时的行为边界：
+- 不启动 `router_sampler`，`router_speed_data.json` 不再更新（其他脚本若依赖该文件需自行注意）
+- **不写入任何规则状态**：路由器规则保持现状。若关闭时规则正处于「已启用」，限速会一直生效，需手动在 NetLimiter 里关；关闭时会打一条 `ROUTER_RULE_DISABLED_BY_CONFIG` 日志提示当前规则状态
+- 双击 `main.lnk` 启动时环境变量不生效，需改快捷方式的 Arguments 加 `--no-router`，或用 `setx NL_ROUTER_RULE_ENABLED 0` 写用户级环境变量
+- 该开关同步存在于 `rule_checker.py`；PowerShell 版本（`ps/rule_checker.ps1`、`ps/supervisor.ps1`）尚未同步
+
 ### PowerShell — 启动 / 安装为服务
 
 ```powershell

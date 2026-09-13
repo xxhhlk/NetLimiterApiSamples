@@ -15,6 +15,7 @@ import sys
 import time
 import signal
 import json
+import argparse
 import multiprocessing as mp
 from pathlib import Path
 from datetime import datetime
@@ -54,6 +55,7 @@ disable_quick_edit_mode()
 # 添加当前目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+from common import ENV_ROUTER_RULE_ENABLED, env_flag
 from common.logger import Logger
 
 
@@ -177,11 +179,19 @@ class Supervisor:
         },
     }
     
-    def __init__(self):
+    def __init__(self, router_enabled: Optional[bool] = None):
         self.logger = Logger("supervisor")
         self.modules: Dict[str, ModuleProcess] = {}
         self.running = True
         self.monitor_interval = 12  # 监控间隔（秒）
+
+        # 路由器规则链总开关：关闭则既不启动 router_sampler，也不让 rule_checker 判定路由器规则
+        self.router_rule_enabled = (
+            env_flag(ENV_ROUTER_RULE_ENABLED, True) if router_enabled is None else router_enabled
+        )
+        if not self.router_rule_enabled:
+            # 实例级过滤，不污染类属性 MODULES
+            self.MODULES = {k: v for k, v in type(self).MODULES.items() if k != "router_sampler"}
 
         # 健康检查连续失败计数（按模块）
         self._health_failures: Dict[str, int] = {}
@@ -214,7 +224,19 @@ class Supervisor:
     
     def start_all(self):
         """启动所有模块"""
-        self.logger.info("启动所有模块...", event="START_ALL")
+        # 把解析后的开关下发给子进程（子进程继承环境变量，rule_checker 据此跳过路由器规则）
+        os.environ[ENV_ROUTER_RULE_ENABLED] = "1" if self.router_rule_enabled else "0"
+        if not self.router_rule_enabled:
+            self.logger.warn(
+                f"路由器规则链已关闭 (--no-router / {ENV_ROUTER_RULE_ENABLED}=0)："
+                f"不启动 router_sampler，rule_checker 跳过路由器规则判定",
+                event="ROUTER_RULE_DISABLED_BY_CONFIG"
+            )
+
+        self.logger.info(
+            f"启动所有模块... 待启动: {', '.join(self.MODULES.keys())}",
+            event="START_ALL"
+        )
         
         for name, config in self.MODULES.items():
             try:
@@ -424,6 +446,10 @@ class Supervisor:
         """主运行方法"""
         self.logger.info("=" * 50, event="BANNER")
         self.logger.info("NetLimiter 监控系统启动", event="BANNER")
+        self.logger.info(
+            f"路由器规则链: {'启用' if self.router_rule_enabled else '关闭'}",
+            event="BANNER"
+        )
         self.logger.info("=" * 50, event="BANNER")
         
         try:
@@ -444,7 +470,22 @@ def main():
     # Windows 多进程支持
     mp.freeze_support()
 
-    supervisor = Supervisor()
+    parser = argparse.ArgumentParser(description="NetLimiter 监控系统")
+    parser.add_argument("--service", action="store_true", help="服务模式运行")
+    parser.add_argument("--no-router", action="store_true",
+                        help=f"不启用路由器规则链：不启动 router_sampler，rule_checker 跳过路由器规则 "
+                             f"（等价于 {ENV_ROUTER_RULE_ENABLED}=0）")
+    parser.add_argument("--router", action="store_true",
+                        help="强制启用路由器规则链（覆盖环境变量）")
+    args = parser.parse_args()
+
+    router_enabled = None
+    if args.no_router:
+        router_enabled = False
+    elif args.router:
+        router_enabled = True
+
+    supervisor = Supervisor(router_enabled=router_enabled)
     supervisor.run()
 
 
