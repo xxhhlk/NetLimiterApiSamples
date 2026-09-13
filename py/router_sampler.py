@@ -106,7 +106,7 @@ class RouterSpeedSampler:
     ROUTER_PORT = 14033
     ROUTER_SCRIPT = "/opt/root/speed_num_only.sh"
     SSH_KEY_PATH = Path.home() / ".ssh" / "id_rsa"
-    THRESHOLD_KB = 800
+    THRESHOLD_KB = 1000
     CONSECUTIVE_SECONDS = 3
     INTERNET_FILTER_NAME = "true internet"  # 真实外网流量过滤器名称（自动发现用，替换原 Internet 区域）
     INTERNET_FILTER_FALLBACK_ID = 2  # 未发现 true internet 时退回的 Internet 区域 InternalId

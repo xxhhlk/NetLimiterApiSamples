@@ -251,8 +251,8 @@ cd ps
 
 | 规则 | Rule ID（示例） | 启用条件 | 禁用条件 | 检查间隔 |
 |------|----------------|----------|----------|----------|
-| qBittorrent 上传 | `7c9220f2-74b4-4e22-aa1f-119271543f2a` | 4 样本均值 ≥ **600 KB/s** | 连续低于阈值 **90 秒** | 20 秒 |
-| 路由器上行 | `d36d9bf8-02f1-41d1-9d89-be65b2d4360a` | 路由器速度 − 本机均值 > **800 KB/s** 持续 **3 秒** | 连续低于阈值 **10 秒** | 2 秒 |
+| qBittorrent 上传 | `7c9220f2-74b4-4e22-aa1f-119271543f2a` | priv 采样 4 样本均值 ≥ **600 KB/s** | 连续低于阈值 **90 秒** | 20 秒 |
+| 路由器上行 | `d36d9bf8-02f1-41d1-9d89-be65b2d4360a` | 路由器速度 − 本机均值 > **1000 KB/s** 持续 **3 秒** | 连续低于阈值 **10 秒** | 2 秒 |
 
 > 阈值、Rule ID、采样间隔均定义在 `py/rule_checker.py` 与 `ps/rule_checker.ps1` 顶部的常量中，可按需修改。请先在你的 NetLimiter 中创建对应规则并填入其真实 GUID。
 
@@ -260,12 +260,16 @@ cd ps
 
 ### 过滤器 ID
 
-| 名称 | InternalId / FilterId |
-|------|------------------------|
-| Private Internet（qBittorrent） | `44` |
-| Internet 区域 | `2` |
-| LocalNetwork（LAN） | `1` |
-| Any | `3` |
+**不要硬编码 InternalId** —— 该值会随过滤器增删被复用（本机就发生过 `44` 从 priv 变成 `Internet Download Manager (IDM)`，
+导致采样恒 0、阈值永不触发且日志静默）。稳定的是过滤器 GUID 与名称，脚本按下列方式动态发现：
+
+| 名称 | GUID（优先匹配） | 发现方式 |
+|------|------------------|----------|
+| Private Internet（qBittorrent 私有实例） | `f27a7daf-ae74-47c2-8a38-6d17310127e4` | `speed_sampler`：GUID → 名称 `zzz_qbit_priv_internet`，都失败则退出交 supervisor 重启 |
+| true internet / true local | — | `router_sampler`：按名称自动发现 |
+| Internet 区域 | `2bc7c021-b058-45dc-b22f-73d8e10e3fef` | 仅作 `true internet` 未发现时的兜底（InternalId `2`） |
+
+> 注意：`Rule.FilterId`（规则上）是 **GUID**，稳定；`FilterNode.FilterId`（节点上）是 **InternalId**，会变。两者不要混用。
 
 ### 关闭本机提权要求
 

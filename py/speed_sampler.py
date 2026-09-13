@@ -48,7 +48,13 @@ class SpeedSampler:
     """速度采样器 - 使用独立心跳线程"""
 
     # 配置常量
-    PRIV_INTERNET_FILTER_ID = 44  # Private Internet 过滤器 ID
+    # Private Internet 过滤器（qBittorrent 私有实例）的定位方式
+    # 注意：禁止硬编码 InternalId —— 该值随过滤器增删被复用（实测 44 已归属
+    # "Internet Download Manager (IDM)"，priv 现在是 42），硬编码会导致采到别的过滤器
+    # 且数值恒 0，使下游 rule_checker 永远达不到阈值（静默失效）。
+    # 优先按 GUID 发现（稳定），其次按名称；都失败则退出交 supervisor 重启。
+    PRIV_FILTER_GUID = "f27a7daf-ae74-47c2-8a38-6d17310127e4"
+    PRIV_FILTER_NAME = "zzz_qbit_priv_internet"
     HISTORY_SECONDS = 4           # 历史窗口大小（样本数）
     SAMPLE_INTERVAL = 5.0         # 采样间隔（秒）
     MAX_RETRIES = 5               # 最大重试次数
@@ -64,6 +70,8 @@ class SpeedSampler:
         self.cli = None
         self.node_loader = None
         self.filter_node = None  # 缓存过滤器节点引用
+        self.filter_id: Optional[int] = None       # 本次发现到的 priv 过滤器 InternalId
+        self._last_filter_id: Optional[int] = None  # 上次发现结果，用于检测 ID 漂移
 
 
         # 采样数据
@@ -144,6 +152,71 @@ class SpeedSampler:
         self.node_loader = None
         self.filter_node = None
 
+    def _discover_filter_id(self) -> Optional[int]:
+        """发现 Private Internet 过滤器的 InternalId（GUID 优先，其次名称）
+
+        InternalId 会随过滤器增删被复用（实测 44 已变成 IDM），所以必须动态发现。
+        返回 None 表示未能定位，调用方应视为致命错误（不静默采错过滤器）。
+        """
+        if not self.cli:
+            return None
+
+        # 1) 按 GUID 精确匹配（最稳）
+        try:
+            for f in self.cli.Filters:  # type: ignore
+                if str(f.Id).lower().strip("{}") == self.PRIV_FILTER_GUID.lower():
+                    self.logger.info(
+                        f"priv 过滤器已定位: Name={f.Name}, FilterId={f.InternalId} (GUID 匹配)",
+                        event="PRIV_FILTER_FOUND"
+                    )
+                    return int(f.InternalId)
+        except Exception as e:
+            self.logger.warn(f"遍历 Filters(GUID) 失败: {e}", event="PRIV_FILTER_DISCOVER_FAIL")
+
+        # 2) 退回按名称匹配
+        try:
+            for f in self.cli.Filters:  # type: ignore
+                if (f.Name or "").strip().lower() == self.PRIV_FILTER_NAME.lower():
+                    self.logger.warn(
+                        f"priv 过滤器按名称定位: Name={f.Name}, FilterId={f.InternalId}"
+                        f"（GUID 未匹配，请核对过滤器是否被重建）",
+                        event="PRIV_FILTER_FOUND_BY_NAME"
+                    )
+                    return int(f.InternalId)
+        except Exception as e:
+            self.logger.warn(f"遍历 Filters(名称) 失败: {e}", event="PRIV_FILTER_DISCOVER_FAIL")
+
+        self.logger.error(
+            f"未找到 priv 过滤器 (GUID={self.PRIV_FILTER_GUID}, Name={self.PRIV_FILTER_NAME})，"
+            "拒绝继续采样以避免读到错误过滤器",
+            event="PRIV_FILTER_NOT_FOUND"
+        )
+        return None
+
+    def _resolve_filter_node(self) -> bool:
+        """发现并缓存 priv 过滤器节点；返回 False 表示定位失败"""
+        fid = self._discover_filter_id()
+        if fid is None:
+            return False
+
+        if self._last_filter_id is not None and self._last_filter_id != fid:
+            self.logger.warn(
+                f"priv 过滤器 InternalId 发生变更: {self._last_filter_id} -> {fid}",
+                event="PRIV_FILTER_ID_CHANGED"
+            )
+        self._last_filter_id = fid
+        self.filter_id = fid
+
+        self.node_loader.Load()  # type: ignore
+        for node in self.node_loader.Filters.Nodes:  # type: ignore
+            if node.FilterId == fid:
+                self.filter_node = node
+                return True
+
+        self.logger.warn(f"过滤器节点未找到 (FilterId={fid})", event="FILTER_NOT_FOUND")
+        self.filter_node = None
+        return False
+
     def _reconnect(self) -> bool:
         """重新连接 NetLimiter API"""
         self.logger.info("正在尝试重新连接 NetLimiter...", event="RECONNECT_START")
@@ -163,30 +236,23 @@ class SpeedSampler:
                 self.cli.Connect()
                 self.node_loader = self.cli.CreateNodeLoader()  # type: ignore
                 self.node_loader.Filters.SelectAll()  # type: ignore
-                self.node_loader.Load()  # type: ignore
 
-                # 重新查找过滤器
-                self.filter_node = None
-                for node in self.node_loader.Filters.Nodes:  # type: ignore
-                    if node.FilterId == self.PRIV_INTERNET_FILTER_ID:
-                        self.filter_node = node
-                        break
-
-                if self.filter_node:
-                    # 重置基准值
-                    self.previous_out = self.filter_node.Transferred.Out
-                    self.previous_sample_ts = time.time()
-                    self.logger.info(
-                        f"重新连接成功，过滤器已缓存 (ID={self.PRIV_INTERNET_FILTER_ID})",
-                        event="RECONNECT_SUCCESS"
-                    )
-                    self.heartbeat.update_status("OK")
-                    # 重置错误计数
-                    self._consecutive_errors = 0
-                    return True
-                else:
-                    self.logger.warn("重新连接成功但未找到过滤器", event="RECONNECT_NO_FILTER")
+                # 重新发现过滤器（InternalId 可能已漂移）
+                if not self._resolve_filter_node():
+                    self.logger.error("重新连接后未能定位 priv 过滤器", event="RECONNECT_NO_FILTER")
                     return False
+
+                # 重置基准值
+                self.previous_out = self.filter_node.Transferred.Out
+                self.previous_sample_ts = time.time()
+                self.logger.info(
+                    f"重新连接成功，过滤器已缓存 (Name={self.PRIV_FILTER_NAME}, FilterId={self.filter_id})",
+                    event="RECONNECT_SUCCESS"
+                )
+                self.heartbeat.update_status("OK")
+                # 重置错误计数
+                self._consecutive_errors = 0
+                return True
 
             except Exception as e:
                 retry_count += 1
@@ -216,17 +282,14 @@ class SpeedSampler:
                 self.node_loader = self.cli.CreateNodeLoader()  # type: ignore
                 self.node_loader.Filters.SelectAll()  # type: ignore
 
-                # 预加载并缓存过滤器节点
-                self.node_loader.Load()  # type: ignore
-                for node in self.node_loader.Filters.Nodes:  # type: ignore
-                    if node.FilterId == self.PRIV_INTERNET_FILTER_ID:
-                        self.filter_node = node
-                        break
+                # 动态发现 priv 过滤器（禁止硬编码 InternalId）
+                if not self._resolve_filter_node():
+                    raise RuntimeError("未能定位 priv 过滤器")
 
-                if self.filter_node:
-                    self.logger.info(f"API 已连接，过滤器节点已缓存 (ID={self.PRIV_INTERNET_FILTER_ID})", event="API_CONNECTED")
-                else:
-                    self.logger.warn(f"API 已连接，但未找到过滤器 (ID={self.PRIV_INTERNET_FILTER_ID})", event="FILTER_NOT_FOUND")
+                self.logger.info(
+                    f"API 已连接，过滤器节点已缓存 (Name={self.PRIV_FILTER_NAME}, FilterId={self.filter_id})",
+                    event="API_CONNECTED"
+                )
 
                 self.heartbeat.update_status("OK")
                 return True
@@ -402,18 +465,19 @@ class SpeedSampler:
             self.heartbeat.update_status("ERROR", "connection_failed")
             sys.exit(1)
         
-        # 初始化首次采样
+        # 初始化首次采样基线
+        if self.filter_node is None:
+            self.logger.error("未缓存 priv 过滤器节点，退出交 supervisor 重启", event="INIT_FAILED")
+            sys.exit(1)
+
         try:
             self.node_loader.Load()  # type: ignore
-            for node in self.node_loader.Filters.Nodes:  # type: ignore
-                if node.FilterId == self.PRIV_INTERNET_FILTER_ID:
-                    self.previous_out = node.Transferred.Out
-                    self.previous_sample_ts = time.time()
-                    self.logger.info(
-                        f"首次采样，初始化基线: 过滤器={self.PRIV_INTERNET_FILTER_ID}, Out={self.previous_out}B",
-                        event="INIT_BASELINE"
-                    )
-                    break
+            self.previous_out = self.filter_node.Transferred.Out
+            self.previous_sample_ts = time.time()
+            self.logger.info(
+                f"首次采样，初始化基线: 过滤器={self.PRIV_FILTER_NAME}(FilterId={self.filter_id}), Out={self.previous_out}B",
+                event="INIT_BASELINE"
+            )
         except Exception as e:
             self.logger.error(f"初始化失败: {e}", event="INIT_FAILED")
         

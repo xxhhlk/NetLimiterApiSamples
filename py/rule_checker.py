@@ -60,7 +60,7 @@ class RuleChecker:
     
     # 路由器速度检查配置
     ROUTER_RULE_ID = "d36d9bf8-02f1-41d1-9d89-be65b2d4360a"
-    ROUTER_THRESHOLD_KB = 800  # 路由器规则阈值（与 router_sampler 一致）
+    ROUTER_THRESHOLD_KB = 1000  # 路由器规则阈值（与 router_sampler 一致）
     ROUTER_CONSECUTIVE_SECONDS = 3
     ROUTER_CHECK_INTERVAL_SECONDS = 2
     ROUTER_BELOW_THRESHOLD_SECONDS = 10  # 连续低于阈值 10 秒后恢复网速
@@ -68,6 +68,10 @@ class RuleChecker:
     # 冷却机制：触发规则后间隔变为3倍，60秒后恢复
     COOLDOWN_MULTIPLIER = 3
     COOLDOWN_SECONDS = 60
+
+    # 采样源健康检查：qb 数据长期恒 0 时告警（不参与判定，仅暴露"采样读错过滤器"类静默失效）
+    ZERO_ALERT_AFTER_SECONDS = 600    # 连续 10 分钟 AvgSpeedKB == 0 开始告警
+    ZERO_ALERT_REPEAT_SECONDS = 3600  # 之后每 60 分钟重复一次
 
     # 连接错误自动恢复配置
     MAX_CONSECUTIVE_ERRORS = 10  # 连续错误最大次数，超过则退出
@@ -96,6 +100,10 @@ class RuleChecker:
 
         # 低于阈值连续时间跟踪（用于禁用判定）
         self._below_threshold_since: Optional[float] = None
+
+        # 采样源零值看护状态
+        self._zero_since: Optional[float] = None
+        self._last_zero_alert: float = 0.0
 
         # NetLimiter 客户端
         self.client: Optional[NLClient] = None
@@ -492,6 +500,45 @@ class RuleChecker:
             self.logger.error(f"Qbit规则检查错误: {e}", event="RULE_CHECK_ERROR", reason=error_msg)
             self._handle_api_error(error_msg, "Qbit规则检查")
 
+    def _check_zero_data(self, data: Dict[str, Any]) -> None:
+        """采样源零值看护：AvgSpeedKB 长期恒 0 时告警（不参与判定）
+
+        典型场景：speed_sampler 过滤器选取错误 → 采到无流量过滤器 → 恒 0 →
+        阈值永不达成且判定分支无日志（静默失效）。这里只负责把静默变成可见告警。
+        """
+        try:
+            avg = data.get("AvgSpeedKB", 0.0) or 0.0
+            now = time.time()
+
+            if avg > 0:
+                if self._zero_since is not None:
+                    self.logger.info(
+                        f"Qbit采样源恢复非零 (AvgSpeedKB={avg} KB/s)，零值看护复位",
+                        event="QBIT_ZERO_WATCH_RESET"
+                    )
+                    self._zero_since = None
+                return
+
+            if self._zero_since is None:
+                self._zero_since = now
+                return
+
+            elapsed = now - self._zero_since
+            if elapsed < self.ZERO_ALERT_AFTER_SECONDS:
+                return
+            if now - self._last_zero_alert < self.ZERO_ALERT_REPEAT_SECONDS:
+                return
+
+            self._last_zero_alert = now
+            self.logger.warn(
+                f"Qbit采样源持续 {int(elapsed)} 秒恒为 0 (AvgSpeedKB=0)，"
+                f"疑似过滤器选取错误或采样进程异常；阈值 {self.THRESHOLD_KB} KB/s 判定因此永不触发。"
+                f"请核对 speed_sampler 的过滤器发现日志 (PRIV_FILTER_FOUND / PRIV_FILTER_NOT_FOUND)",
+                event="QBIT_ZERO_DATA_SUSPECT"
+            )
+        except Exception as e:
+            self.logger.error(f"零值看护异常: {e}", event="QBIT_ZERO_WATCH_ERROR")
+
     def _get_local_avg_speed_kb(self) -> Optional[float]:
         """获取本机最近10秒平均速度"""
         try:
@@ -677,6 +724,7 @@ class RuleChecker:
                             if self._is_data_fresh(data):
                                 self.data_consecutive_expired = 0
                                 self._check_rule(data)
+                                self._check_zero_data(data)
                             else:
                                 self.data_consecutive_expired += 1
                                 if self.data_consecutive_expired <= 3:  # 只记录前3次过期
