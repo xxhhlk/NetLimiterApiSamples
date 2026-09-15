@@ -155,6 +155,9 @@ class Supervisor:
     HEALTH_FAIL_TOLERANCE = 2        # 连续 N 次健康检查失败才重启（避免单次抖动误杀）
 
     # 模块配置
+    # 注意：这里的 key 必须与模块自己用的 HeartbeatManager 名称一致，
+    # 否则 supervisor 找不到心跳文件（fail-closed 下会被误判为卡死并反复重启）。
+    # 三个模块的心跳名：speed_sampler / router_speed_sampler / rule_checker
     MODULES = {
         "speed_sampler": {
             "description": "速度采样器",
@@ -164,7 +167,7 @@ class Supervisor:
             "data_file": "qb_speed_data.json",
             "data_stale_seconds": 60,
         },
-        "router_sampler": {
+        "router_speed_sampler": {
             "description": "路由器速度采样器",
             "restart_delay": 5,
             "max_restarts": 10,
@@ -191,7 +194,7 @@ class Supervisor:
         )
         if not self.router_rule_enabled:
             # 实例级过滤，不污染类属性 MODULES
-            self.MODULES = {k: v for k, v in type(self).MODULES.items() if k != "router_sampler"}
+            self.MODULES = {k: v for k, v in type(self).MODULES.items() if k != "router_speed_sampler"}
 
         # 健康检查连续失败计数（按模块）
         self._health_failures: Dict[str, int] = {}
@@ -217,7 +220,7 @@ class Supervisor:
         # 使用模块级别函数，避免序列化实例方法
         targets = {
             "speed_sampler": _run_speed_sampler,
-            "router_sampler": _run_router_sampler,
+            "router_speed_sampler": _run_router_sampler,
             "rule_checker": _run_rule_checker,
         }
         return targets.get(name)
