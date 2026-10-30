@@ -78,13 +78,16 @@ supervisor (py/main.py 或 ps/supervisor.ps1)
 - 输出用 `LastUpdate` 时间戳表达新鲜度；`rule_checker` 只接受新鲜数据（qb 5s / router 15s），陈旧一律跳过判定并告警，不用旧快照
 - supervisor 通过 `SUPERVISOR_PID` 环境变量下发给子进程；子进程各自有 watchdog 线程，父进程消失即 `os._exit(2)`
 
-### 双线程 + 三道存活闸（不要退化）
+### 双线程 + 四道存活闸（不要退化）
 
-NetLimiter/SSH 调用会长时间阻塞，因此每个模块都是「主线程跑业务 + 独立 daemon 心跳线程（2s 写 `%TEMP%/nl_watchdog/<module>.heartbeat.json`）」。supervisor 12s 一轮，三道闸**全部 fail-closed**：
+NetLimiter/SSH 调用会长时间阻塞，因此每个模块都是「主线程跑业务 + 独立 daemon 心跳线程（2s 写 `%TEMP%/nl_watchdog/<module>.heartbeat.json`）」。supervisor 12s 一轮，四道闸**全部 fail-closed**：
 
 1. 进程存活（`Process.is_alive()`）
 2. 心跳文件 `last_ok` 超过 10s 未更新；**文件缺失/损坏/解析失败也判异常**（`status=="STOPPED"` 例外放行）
 3. 数据文件 mtime（qb / router 数据 60s 未更新视为主循环假死——抓「心跳线程活、主循环卡住」）
+4. 主循环 `loop_count` 停滞（120s 无增长判主循环假死）。覆盖第 3 道闸够不到的模块：`rule_checker` 不产出数据文件，主循环卡在 NetLimiter 调用里时只有 `loop_count` 能暴露
+
+因此**每个模块主循环都必须调用 `heartbeat.increment_loop()`**（轮末调用，语义是「这一轮完整跑完」）。漏调会让该模块永久停留在 `STARTING`/`loop_count=0`，第 4 道闸会把它当卡死反复重启。阈值取 120s 是因为 `router_sampler` SSH 断线退避单次最长 60s（`SSH_RECONNECT_MAX_DELAY`），需留 2 倍余量。
 
 另有启动宽限 30s、连续 2 次异常才重启、单模块最多 10 次；心跳写入失败要计数并写入 `write_errors` 字段暴露给 supervisor，不能静默吞掉。历史上这三条都曾 fail-open 导致 22 小时无感（`plans/`、`MEMORY.md` 有事故记录）。
 

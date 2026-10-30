@@ -64,7 +64,7 @@ class RuleChecker:
     ROUTER_THRESHOLD_KB = 1000  # 路由器规则阈值（与 router_sampler 一致）
     ROUTER_CONSECUTIVE_SECONDS = 3
     ROUTER_CHECK_INTERVAL_SECONDS = 2
-    ROUTER_BELOW_THRESHOLD_SECONDS = 10  # 连续低于阈值 10 秒后恢复网速
+    ROUTER_BELOW_THRESHOLD_SECONDS = 42  # 连续低于阈值 x 秒后恢复网速
 
     # 冷却机制：触发规则后间隔变为3倍，60秒后恢复
     COOLDOWN_MULTIPLIER = 3
@@ -844,11 +844,17 @@ class RuleChecker:
                     finally:
                         last_router_check = current_time
                 
+                # 主循环活性上报：心跳线程独立运行，只有 loop_count 持续推进才能
+                # 区分「主循环在跑」与「心跳线程活着但主循环卡在 NetLimiter 调用里」
+                self.heartbeat.increment_loop()
+                self.heartbeat.update_status("OK")
+
                 # 高精度短休眠，避免CPU占用过高
                 time.sleep(0.5)
                 
             except Exception as e:
                 self.logger.error(f"主循环异常: {e}", event="MAIN_LOOP_ERROR")
+                self.heartbeat.update_status("ERROR", str(e))
                 time.sleep(1)
         
         # 清理

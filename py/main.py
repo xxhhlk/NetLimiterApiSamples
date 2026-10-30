@@ -153,6 +153,12 @@ class Supervisor:
     HEARTBEAT_TIMEOUT_SECONDS = 10   # 心跳超过该时长未更新视为卡住
     HEARTBEAT_GRACE_SECONDS = 30     # 模块启动后的宽限期（首个心跳尚未落盘）
     HEALTH_FAIL_TOLERANCE = 2        # 连续 N 次健康检查失败才重启（避免单次抖动误杀）
+    # 三级存活信号：主循环 loop_count 是否仍在推进。
+    # 心跳线程独立于主循环，主循环卡在 NetLimiter/SSH 调用里时心跳照常更新；
+    # 数据文件闸只覆盖有产出的模块（rule_checker 不产出数据文件）。
+    # 阈值 120s：router_sampler SSH 断线退避单次最长 60s（SSH_RECONNECT_MAX_DELAY），
+    # 留 2 倍余量，避免把正常重连误判为卡死。
+    LOOP_STALL_SECONDS = 120
 
     # 模块配置
     # 注意：这里的 key 必须与模块自己用的 HeartbeatManager 名称一致，
@@ -202,6 +208,10 @@ class Supervisor:
         self._hb_write_warned: Dict[str, int] = {}
         # 数据文件陈旧已告警标记
         self._data_stale_warned: set = set()
+        # 主循环 loop_count 进展跟踪（上次观测值 / 上次观测到变化的时间 / 已告警标记）
+        self._loop_counts: Dict[str, int] = {}
+        self._loop_progress_at: Dict[str, float] = {}
+        self._loop_stall_warned: set = set()
         
         # 设置信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -372,6 +382,57 @@ class Supervisor:
             # 无法读取时保守放行，避免误杀
             return True
 
+    def _check_loop_progress(self, module_name: str, module: ModuleProcess) -> bool:
+        """
+        三级存活信号：主循环的 loop_count 是否仍在推进
+
+        心跳线程独立于主循环，主循环阻塞在 NetLimiter/SSH 原生调用而 GIL 已释放时，
+        心跳照常更新；数据文件闸只覆盖有产出的模块（rule_checker 不产出数据文件）。
+        loop_count 停滞因此是发现 rule_checker 主循环假死的唯一手段。
+
+        Returns:
+            True: 主循环在推进（或信号不可用，交由其他闸判定）；False: 停滞
+        """
+        # 启动宽限期内不做判断（初始化阶段主循环尚未进入）
+        if self._module_uptime(module) < self.HEARTBEAT_GRACE_SECONDS:
+            return True
+
+        try:
+            heartbeat_file = self._heartbeat_dir() / f"{module_name}.heartbeat.json"
+            data = json.loads(heartbeat_file.read_text(encoding='utf-8'))
+
+            # 主动退出不算卡死
+            if data.get("status") == "STOPPED":
+                return True
+
+            loop_count = data.get("loop_count")
+            if not isinstance(loop_count, int):
+                # 旧版模块不写该字段，无法判定，放行避免误杀
+                return True
+
+            now = time.time()
+            prev = self._loop_counts.get(module_name)
+            if prev is None or loop_count != prev:
+                self._loop_counts[module_name] = loop_count
+                self._loop_progress_at[module_name] = now
+                self._loop_stall_warned.discard(module_name)
+                return True
+
+            stalled = now - self._loop_progress_at.get(module_name, now)
+            if stalled >= self.LOOP_STALL_SECONDS:
+                if module_name not in self._loop_stall_warned:
+                    self._loop_stall_warned.add(module_name)
+                    self.logger.warn(
+                        f"模块 {module_name} 主循环 loop_count 停滞 {stalled:.0f}s "
+                        f"(当前 {loop_count}，上限 {self.LOOP_STALL_SECONDS}s)，疑似主循环卡死",
+                        event="MODULE_LOOP_STALL"
+                    )
+                return False
+            return True
+        except Exception:
+            # 读取/解析失败交给心跳闸判定，避免同一故障重复计失败
+            return True
+
     def monitor(self):
         """监控循环 - 同时检查进程状态、心跳状态与数据文件新鲜度"""
         self.logger.info(f"开始监控，间隔 {self.monitor_interval} 秒", event="MONITOR_START")
@@ -394,6 +455,8 @@ class Supervisor:
                             failures.append("心跳超时(可能卡住)")
                         if not self._check_data_file(name, module):
                             failures.append("数据文件停止更新(主循环卡住)")
+                        if not self._check_loop_progress(name, module):
+                            failures.append("主循环 loop_count 停滞(可能卡死)")
 
                         if not failures:
                             # 全部正常，清零连续失败计数
@@ -432,6 +495,9 @@ class Supervisor:
                         # 重启后重置健康状态跟踪
                         self._health_failures[name] = 0
                         self._data_stale_warned.discard(name)
+                        self._loop_counts.pop(name, None)
+                        self._loop_progress_at.pop(name, None)
+                        self._loop_stall_warned.discard(name)
                     else:
                         self.logger.error(
                             f"模块 {name} 重启次数已达上限 {max_restarts}，不再重启",
