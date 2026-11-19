@@ -45,6 +45,9 @@ from common import ENV_ROUTER_RULE_ENABLED, env_flag
 from common.heartbeat import HeartbeatManager
 from common.logger import Logger
 
+# 上传限速看门狗总开关（默认启用）
+ENV_UPLOAD_GUARD_ENABLED = "NL_UPLOAD_GUARD_ENABLED"
+
 
 class RuleChecker:
     """规则检查器"""
@@ -53,7 +56,7 @@ class RuleChecker:
     # 规则归属过滤器: zzz_qbit_pub_internet (InternalId=69)
     # 2026-09-12 从组合过滤 2ad0b10c-379a-4a0e-ad5b-2dd863d8b312(InternalId=40) 搬运而来
     LIMIT_RULE_ID = "7c9220f2-74b4-4e22-aa1f-119271543f2a"
-    THRESHOLD_KB = 600
+    THRESHOLD_KB = 450
     CHECK_INTERVAL_SECONDS = 20
     FIRST_CHECK_DELAY_SECONDS = 5
     RETRY_INTERVAL_SECONDS = 10
@@ -91,6 +94,27 @@ class RuleChecker:
     LOCK_FILE = Path(os.environ.get("TEMP", ".")) / "qb_speed_data.lock"
     ROUTER_DATA_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.json"
     ROUTER_LOCK_FILE = Path(os.environ.get("TEMP", ".")) / "router_speed_data.lock"
+
+    # ------------------------------------------------------------------
+    # 上传限速规则看门狗
+    #
+    # 目标：非本脚本控制的「Out 方向 + 限速 < 3MB/s」LimitRule。这类规则多由手工
+    # 调试或第三方工具创建，一旦被打开就没人关，上传会被长期压在几百 KB/s。
+    # 只对"连续启用超过 30 分钟"的规则动手，避免误伤临时手动限速。
+    #
+    # 注意：带 Action=Start 时间条件的规则整条跳过 —— 那是 NetLimiter 自身调度器
+    # 在启用/禁用（如周末 01:00 自动提速），看门狗一禁，下次 Start 条件又开回来，
+    # 会形成反复拉锯。
+    # ------------------------------------------------------------------
+    UPLOAD_GUARD_THRESHOLD_BYTES = 3 * 1024 * 1024   # 3 MiB/s（严格小于才命中）
+    UPLOAD_GUARD_ENABLED_SECONDS = 1800              # 连续启用 30 分钟后自动禁用
+    UPLOAD_GUARD_CHECK_INTERVAL_SECONDS = 60         # 看门狗轮询间隔
+    UPLOAD_GUARD_STATE_FILE = Path(os.environ.get("TEMP", ".")) / "nl_upload_rule_guard.json"
+    # 本脚本自己会动态开关的规则，看门狗必须回避（否则会跟 rule_checker 抢控制权）
+    UPLOAD_GUARD_EXCLUDE_RULE_IDS = frozenset({
+        LIMIT_RULE_ID.lower(),      # qBittorrent 限速规则
+        ROUTER_RULE_ID.lower(),     # 路由器限速规则
+    })
     
     def __init__(self, router_rule_enabled: Optional[bool] = None):
         self.logger = Logger("rule_checker")
@@ -137,6 +161,11 @@ class RuleChecker:
         # 错误计数器
         self._consecutive_errors = 0
         self._last_error_type = None
+
+        # 上传限速看门狗状态
+        self.upload_guard_enabled = env_flag(ENV_UPLOAD_GUARD_ENABLED, True)
+        self._last_upload_guard_check: float = 0.0
+        self._upload_guard_write_warned = False
         
         # 父进程检测
         self.supervisor_pid = os.environ.get("SUPERVISOR_PID")
@@ -193,6 +222,93 @@ class RuleChecker:
         error_lower = error_msg.lower()
         return any(kw.lower() in error_lower for kw in connection_error_keywords)
 
+    def _is_revision_error(self, error_msg: str) -> bool:
+        """检测是否是 NetLimiter 规则版本(乐观锁)冲突
+
+        典型报错：There is already newer revision of the rule <guid>.
+        成因：规则对象被缓存后，期间有人在 NetLimiter UI 或别的进程改过该规则，
+        revision 递增；再用旧对象 UpdateRule 就被服务拒绝。
+        """
+        revision_keywords = (
+            "newer revision",
+            "already newer",
+            "revision of the rule",
+            "较新的版本",
+            "版本冲突",
+        )
+        error_lower = error_msg.lower()
+        return any(kw.lower() in error_lower for kw in revision_keywords)
+
+    def _set_rule_enabled_safe(self, rule_id: str, enabled: bool, context: str = "") -> bool:
+        """安全地设置规则 IsEnabled，自动处理 NetLimiter revision 冲突。
+
+        冲突时丢弃过时的缓存对象，从服务器重新拉取最新规则再重试（最多 3 次）。
+        这是"手动改规则后脚本再也关不掉"的根治点：旧实现只在成功后清缓存，
+        一旦 revision 冲突就永远用旧对象重试，形成死循环。
+
+        Args:
+            rule_id: 规则 GUID
+            enabled: 目标启用状态
+            context: 日志上下文前缀（如 "路由器规则" / "Qbit规则"）
+
+        Returns:
+            True  写入成功，或规则本就处于目标状态；
+            False 规则不存在，或 revision 冲突重试耗尽（其余异常向上抛）。
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            rule = self._get_cached_rule(rule_id)
+            if rule is None:
+                self.logger.error(
+                    f"{context}未找到规则 {rule_id}，无法设置启用状态",
+                    event="RULE_NOT_FOUND"
+                )
+                return False
+
+            # 已是目标状态：仅在首次尝试时短路，避免用旧对象做无意义写入。
+            # 注意：revision 冲突后的重试必须强制写入——前一次尝试已在本地对象上
+            # 改过 IsEnabled，若此时短路会误判"已生效"，实际服务端并未写入成功。
+            if attempt == 1:
+                try:
+                    if bool(rule.IsEnabled) == enabled:
+                        return True
+                except Exception:
+                    pass
+
+            try:
+                rule.IsEnabled = enabled
+                self.client.UpdateRule(rule)  # type: ignore
+            except Exception as e:
+                error_msg = str(e)
+                if not self._is_revision_error(error_msg):
+                    # 非版本冲突：交给调用方 _handle_api_error 处理（重连/计数/退出）
+                    raise
+                # 关键：清掉过时缓存，下一轮 _get_cached_rule 会从服务器重新拉取
+                self._rule_cache.pop(rule_id, None)
+                self.logger.warn(
+                    f"{context}规则 {rule_id} revision 冲突（第 {attempt}/{max_attempts} 次），"
+                    f"已刷新规则对象，稍后重试: {error_msg[:120]}",
+                    event="RULE_REVISION_CONFLICT"
+                )
+                if attempt < max_attempts:
+                    continue
+                self.logger.error(
+                    f"{context}规则 {rule_id} revision 冲突，重试 {max_attempts} 次仍失败，本轮放弃写入",
+                    event="RULE_REVISION_RETRY_EXHAUSTED"
+                )
+                return False
+
+            # 写入成功：清缓存，强制下次重新获取以验证实际状态
+            self._rule_cache.pop(rule_id, None)
+            if attempt > 1:
+                self.logger.info(
+                    f"{context}规则 {rule_id} 在第 {attempt} 次尝试写入成功",
+                    event="RULE_REVISION_RETRY_OK"
+                )
+            return True
+
+        return False
+
     def _cleanup_connection(self):
         """清理 NetLimiter 连接"""
         try:
@@ -210,6 +326,16 @@ class RuleChecker:
         Returns:
             True 表示已处理（重连成功或决定退出），False 表示未处理
         """
+        # revision 冲突由 _set_rule_enabled_safe 内部重试处理；即使漏到这里，
+        # 也是"规则在别处被改动"这种可恢复事件，不应计入连续错误误杀进程
+        if self._is_revision_error(error_msg):
+            self.logger.warn(
+                f"{context}: 规则版本冲突（已在别处被修改），跳过本轮，不计入连续错误",
+                event="RULE_REVISION_SKIPPED"
+            )
+            self._rule_cache.clear()
+            return True
+
         if not self._is_connection_error(error_msg):
             # 非连接错误，只增加计数
             self._consecutive_errors += 1
@@ -477,10 +603,8 @@ class RuleChecker:
             rule_enabled = rule.IsEnabled
 
             if avg_speed_kb >= self.THRESHOLD_KB and not rule_enabled:
-                rule.IsEnabled = True
-                self.client.UpdateRule(rule)  # type: ignore
-                # 清除缓存，强制下次重新获取以验证
-                self._rule_cache.pop(self.LIMIT_RULE_ID, None)
+                if not self._set_rule_enabled_safe(self.LIMIT_RULE_ID, True, "Qbit规则"):
+                    return
                 # 记录规则变更时间，触发冷却
                 self._last_rule_change_time = time.time()
                 cooldown_end = self._last_rule_change_time + self.COOLDOWN_SECONDS
@@ -499,10 +623,8 @@ class RuleChecker:
 
                 # 只有连续低于阈值 90 秒才禁用
                 if elapsed >= 90:
-                    rule.IsEnabled = False
-                    self.client.UpdateRule(rule)  # type: ignore
-                    # 清除缓存，强制下次重新获取以验证
-                    self._rule_cache.pop(self.LIMIT_RULE_ID, None)
+                    if not self._set_rule_enabled_safe(self.LIMIT_RULE_ID, False, "Qbit规则"):
+                        return
                     # 记录规则变更时间，触发冷却
                     self._last_rule_change_time = time.time()
                     cooldown_end = self._last_rule_change_time + self.COOLDOWN_SECONDS
@@ -625,6 +747,190 @@ class RuleChecker:
             self.logger.error(f"获取本机平均速度失败: {e}", event="LOCAL_AVG_ERROR")
             return None
     
+    # ------------------------------------------------------------------
+    # 上传限速规则看门狗
+    # ------------------------------------------------------------------
+    def _rule_has_start_condition(self, rule) -> bool:
+        """规则是否带 Action=Start 的时间条件
+
+        这类规则的启用/禁用由 NetLimiter 自身调度器负责（例如周末 01:00 自动开启）。
+        看门狗一旦禁用，下次 Start 条件又会开回来，形成反复拉锯，因此整条规则跳过。
+        条件读不出来时同样跳过（fail-safe：宁可不管，也不误伤计划任务）。
+        """
+        try:
+            conds = list(rule.Conditions) if rule.Conditions else []
+        except Exception:
+            return True
+
+        for c in conds:
+            try:
+                if c.GetType().Name != "TimeCondition":
+                    continue
+                if str(getattr(c, "Action", "")).strip().lower() == "start":
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def _is_upload_guard_target(self, rule) -> bool:
+        """是否属于看门狗管辖：LimitRule + Out/Both 方向 + 限速 < 3MB/s + 非本脚本控制"""
+        try:
+            if rule.GetType().Name != "LimitRule":
+                return False
+            if str(rule.Id).lower() in self.UPLOAD_GUARD_EXCLUDE_RULE_IDS:
+                return False
+            # "Out" 与 "Both" 都会产生上传方向限速；注意 "both" 不含子串 "out"
+            if str(rule.Dir).strip().lower() not in ("out", "both"):
+                return False
+            limit = int(rule.LimitSize)
+            # limit == 0 表示不限速，不属于管辖范围
+            return 0 < limit < self.UPLOAD_GUARD_THRESHOLD_BYTES
+        except Exception:
+            return False
+
+    def _load_upload_guard_state(self) -> Dict[str, Any]:
+        """读取计时状态（落盘，跨 rule_checker 重启保留）"""
+        try:
+            if not self.UPLOAD_GUARD_STATE_FILE.exists():
+                return {}
+            data = json.loads(self.UPLOAD_GUARD_STATE_FILE.read_text(encoding="utf-8"))
+            rules = data.get("rules")
+            return rules if isinstance(rules, dict) else {}
+        except Exception as e:
+            self.logger.warn(
+                f"读取上传看门狗状态失败，按空状态处理: {e}",
+                event="UPLOAD_GUARD_STATE_READ_ERROR"
+            )
+            return {}
+
+    def _save_upload_guard_state(self, rules: Dict[str, Any]) -> None:
+        """原子写入计时状态"""
+        try:
+            self.UPLOAD_GUARD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(self.UPLOAD_GUARD_STATE_FILE) + ".tmp"
+            payload = {"updated_at": datetime.now().isoformat(), "rules": rules}
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self.UPLOAD_GUARD_STATE_FILE)
+            self._upload_guard_write_warned = False
+        except Exception as e:
+            # 写盘失败只告警一次，避免每 60 秒刷屏；计时退化为内存态（本次进程内仍有效）
+            if not self._upload_guard_write_warned:
+                self._upload_guard_write_warned = True
+                self.logger.warn(
+                    f"写入上传看门狗状态失败（计时将无法跨重启保留）: {e}",
+                    event="UPLOAD_GUARD_STATE_WRITE_ERROR"
+                )
+
+    def _check_upload_rule_guard(self) -> None:
+        """非脚本控制的 <3MB 上传限速规则兜底：连续启用 30 分钟即自动禁用
+
+        只在规则"仍处于启用"时累计时长；规则一旦被关闭（人工或时间条件），
+        计时条目随之丢弃，下次启用重新从 0 开始。
+        """
+        if not self._is_client_connected():
+            if not self._connect_nl_client():
+                return
+            self._rule_cache.clear()
+
+        try:
+            rules = list(self.client.Rules)
+        except Exception as e:
+            self.logger.warn(f"枚举规则失败，跳过本轮上传看门狗: {e}", event="UPLOAD_GUARD_ENUM_ERROR")
+            return
+
+        now = time.time()
+        old_state = self._load_upload_guard_state()
+        new_state: Dict[str, Any] = {}
+
+        for rule in rules:
+            if not self._is_upload_guard_target(rule):
+                continue
+
+            rid = str(rule.Id)
+            try:
+                if not bool(rule.IsEnabled):
+                    if rid in old_state:
+                        self.logger.info(
+                            f"上传限速规则 {rid} 已关闭，看门狗计时清除",
+                            event="UPLOAD_GUARD_RESET"
+                        )
+                    continue
+            except Exception:
+                continue
+
+            # 计划型规则由 NetLimiter 调度器管理，不干预也不计时
+            if self._rule_has_start_condition(rule):
+                if rid in old_state:
+                    self.logger.info(
+                        f"上传限速规则 {rid} 带时间计划(Start)，看门狗放弃干预并清除计时",
+                        event="UPLOAD_GUARD_SKIP_SCHEDULED"
+                    )
+                continue
+
+            limit_kb = int(rule.LimitSize) / 1024
+            entry = old_state.get(rid)
+            try:
+                since = float(entry["since"]) if entry and "since" in entry else now
+            except Exception:
+                since = now
+            enabled_for = now - since
+
+            if enabled_for >= self.UPLOAD_GUARD_ENABLED_SECONDS:
+                try:
+                    disabled_ok = self._set_rule_enabled_safe(rid, False, "上传看门狗")
+                except Exception as e:
+                    # 非 revision 的回写异常：保留计时条目，下一轮继续尝试
+                    disabled_ok = False
+                    self.logger.error(
+                        f"上传限速规则 {rid} 自动禁用失败: {e}",
+                        event="UPLOAD_GUARD_DISABLE_ERROR",
+                        reason=str(e)
+                    )
+                if not disabled_ok:
+                    # 写入失败（规则消失 / revision 重试耗尽）：保留计时，下一轮再试
+                    new_state[rid] = {
+                        "since": since,
+                        "limit_kb": round(limit_kb, 1),
+                        "filter_id": str(getattr(rule, "FilterId", "")),
+                    }
+                    continue
+
+                self.logger.info(
+                    f"上传限速规则已自动禁用 | 过滤器={getattr(rule, 'FilterId', '?')} | "
+                    f"限速={limit_kb:.1f} KB/s | 已连续启用 {enabled_for / 60:.0f} 分钟",
+                    event="UPLOAD_GUARD_DISABLED"
+                )
+                self.logger.alert(
+                    "UPLOAD_LIMIT_STUCK",
+                    f"非脚本控制的上传限速规则连续启用 {enabled_for / 60:.0f} 分钟，已自动禁用",
+                    {
+                        "rule_id": rid,
+                        "filter_id": str(getattr(rule, "FilterId", "")),
+                        "limit_kb": round(limit_kb, 1),
+                        "enabled_seconds": int(enabled_for),
+                    }
+                )
+                # 禁用后不再保留计时条目
+                continue
+
+            if entry is None:
+                self.logger.info(
+                    f"检测到上传限速规则被启用 | 规则={rid} | "
+                    f"限速={limit_kb:.1f} KB/s | "
+                    f"{self.UPLOAD_GUARD_ENABLED_SECONDS // 60} 分钟后若仍未关闭将自动禁用",
+                    event="UPLOAD_GUARD_ARMED"
+                )
+
+            new_state[rid] = {
+                "since": since,
+                "limit_kb": round(limit_kb, 1),
+                "filter_id": str(getattr(rule, "FilterId", "")),
+            }
+
+        if new_state != old_state:
+            self._save_upload_guard_state(new_state)
+
     def _check_router_rule(self, router_data: Dict[str, Any]):
         """检查并更新路由器限速规则"""
         try:
@@ -658,10 +964,8 @@ class RuleChecker:
 
             # 连续超过阈值指定秒数，启用规则
             if speed_diff > self.ROUTER_THRESHOLD_KB and over_threshold_seconds >= self.ROUTER_CONSECUTIVE_SECONDS and not rule_enabled:
-                rule.IsEnabled = True
-                self.client.UpdateRule(rule)  # type: ignore
-                # 清除缓存，强制下次重新获取以验证
-                self._rule_cache.pop(self.ROUTER_RULE_ID, None)
+                if not self._set_rule_enabled_safe(self.ROUTER_RULE_ID, True, "路由器规则"):
+                    return
                 # 记录规则变更时间，触发冷却
                 self._last_router_rule_change_time = time.time()
                 cooldown_end = self._last_router_rule_change_time + self.COOLDOWN_SECONDS
@@ -673,10 +977,8 @@ class RuleChecker:
                 )
             elif below_threshold_seconds >= self.ROUTER_BELOW_THRESHOLD_SECONDS and rule_enabled:
                 # 连续低于阈值指定秒数，禁用规则
-                rule.IsEnabled = False
-                self.client.UpdateRule(rule)  # type: ignore
-                # 清除缓存，强制下次重新获取以验证
-                self._rule_cache.pop(self.ROUTER_RULE_ID, None)
+                if not self._set_rule_enabled_safe(self.ROUTER_RULE_ID, False, "路由器规则"):
+                    return
                 # 记录规则变更时间，触发冷却
                 self._last_router_rule_change_time = time.time()
                 cooldown_end = self._last_router_rule_change_time + self.COOLDOWN_SECONDS
@@ -761,6 +1063,21 @@ class RuleChecker:
         if not self._connect_nl_client():
             self.logger.error("初始连接失败，退出", event="INIT_CONNECT_FAILED")
             sys.exit(1)
+
+        # 上传限速看门狗状态提示
+        if self.upload_guard_enabled:
+            self.logger.info(
+                f"上传限速看门狗已启用：非脚本控制的 Out 方向、限速 < "
+                f"{self.UPLOAD_GUARD_THRESHOLD_BYTES / 1024 / 1024:.0f}MB/s 的规则，"
+                f"连续启用 {self.UPLOAD_GUARD_ENABLED_SECONDS // 60} 分钟将被自动禁用"
+                f"（带 Start 时间计划的规则跳过）",
+                event="UPLOAD_GUARD_READY"
+            )
+        else:
+            self.logger.warn(
+                f"上传限速看门狗已关闭 ({ENV_UPLOAD_GUARD_ENABLED}=0)",
+                event="UPLOAD_GUARD_DISABLED"
+            )
         
         # 等待速度采样器数据就绪
         if not self._wait_for_speed_sampler():
@@ -843,6 +1160,16 @@ class RuleChecker:
                         self.logger.error(f"路由器检查链路异常: {e}", event="ROUTER_CHECK_ERROR")
                     finally:
                         last_router_check = current_time
+                
+                # 上传限速规则看门狗（默认 60 秒一次，独立于上面两条判定链路）
+                if (self.upload_guard_enabled
+                        and current_time - self._last_upload_guard_check >= self.UPLOAD_GUARD_CHECK_INTERVAL_SECONDS):
+                    try:
+                        self._check_upload_rule_guard()
+                    except Exception as e:
+                        self.logger.error(f"上传限速看门狗异常: {e}", event="UPLOAD_GUARD_ERROR")
+                    finally:
+                        self._last_upload_guard_check = current_time
                 
                 # 主循环活性上报：心跳线程独立运行，只有 loop_count 持续推进才能
                 # 区分「主循环在跑」与「心跳线程活着但主循环卡在 NetLimiter 调用里」
