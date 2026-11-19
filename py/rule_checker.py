@@ -581,6 +581,29 @@ class RuleChecker:
 
         return None
 
+    def _get_fresh_rule(self, rule_id: str):
+        """判定前强制从 NetLimiter 服务器拉取最新规则对象，并刷新缓存。
+
+        与 _get_cached_rule 的区别：即使缓存命中也重新遍历 client.Rules，
+        确保读到服务器当前的 IsEnabled / Revision。
+
+        背景：用户在 NetLimiter UI 手动开关规则只改服务器端，进程内缓存不会自动失效。
+        若判定读缓存旧值，会出现「手动开规则后 rule_enabled 仍是 False → 不进禁用分支
+        → 永远不禁用」的静默失效。写入路径 _set_rule_enabled_safe 的 revision 重试
+        只有在真正调用 UpdateRule 时才触发，判定必须在进入分支前就看到真实状态。
+
+        性能：每次判定遍历一次规则集合（约百条），qbit 每 20s / router 每 2s，开销可忽略。
+        """
+        if not self.client:
+            return None
+        for r in self.client.Rules:  # type: ignore
+            if str(r.Id) == rule_id:
+                self._rule_cache[rule_id] = r
+                return r
+        # 服务器上已无此规则，清掉陈旧缓存避免后续误用
+        self._rule_cache.pop(rule_id, None)
+        return None
+
     def _check_rule(self, data: Dict[str, Any]):
         """检查并更新 qBittorrent 限速规则"""
         try:
@@ -593,8 +616,8 @@ class RuleChecker:
             avg_speed_kb = data.get("AvgSpeedKB", 0.0)
             sample_count = data.get("SampleCount", 0)
 
-            # 使用缓存获取规则
-            rule = self._get_cached_rule(self.LIMIT_RULE_ID)
+            # 判定前强制拉取服务器最新规则，避免手动改规则后缓存旧值导致判定失效
+            rule = self._get_fresh_rule(self.LIMIT_RULE_ID)
 
             if rule is None:
                 self.logger.error(f"未找到规则 {self.LIMIT_RULE_ID}", event="RULE_NOT_FOUND")
@@ -953,8 +976,9 @@ class RuleChecker:
             # 差值计算：路由器速度 - 本机平均速度
             speed_diff = router_speed_kb - local_avg_speed_kb if router_speed_kb is not None else 0
 
-            # 使用缓存获取规则
-            rule = self._get_cached_rule(self.ROUTER_RULE_ID)
+            # 判定前强制拉取服务器最新规则：手动在 UI 改规则（如开启 1M 限速）只改
+            # 服务器端，进程缓存不会失效；读旧缓存会误判 rule_enabled=False 而永不禁用
+            rule = self._get_fresh_rule(self.ROUTER_RULE_ID)
 
             if rule is None:
                 self.logger.error(f"未找到路由器规则 {self.ROUTER_RULE_ID}", event="ROUTER_RULE_NOT_FOUND")
